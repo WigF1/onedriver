@@ -11,6 +11,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/jstaf/onedriver/fs/graph"
+	"github.com/jstaf/onedriver/fs/quota"
 	"github.com/rs/zerolog/log"
 	bolt "go.etcd.io/bbolt"
 )
@@ -28,6 +29,7 @@ type Filesystem struct {
 	root      string // the id of the filesystem's root item
 	deltaLink string
 	uploads   *UploadManager
+	quota     *quota.Cache
 
 	sync.RWMutex
 	offline    bool
@@ -145,6 +147,10 @@ func NewFilesystem(auth *graph.Auth, cacheDir string) *Filesystem {
 	fs.InsertID(fs.root, root)
 
 	fs.uploads = NewUploadManager(2*time.Second, db, fs, auth)
+
+	// statfs is answered from this cache; see BackgroundRefresh
+	fs.quota = quota.New(fs.fetchDrive, quota.DefaultTTL)
+	fs.loadSavedDrive()
 
 	if !fs.IsOffline() {
 		// .Trash-UID is used by "gio trash" for user trash, create it if it
