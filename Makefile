@@ -1,4 +1,4 @@
-.PHONY: all, test, test-init, srpm, rpm, dsc, changes, deb, clean, install, uninstall
+.PHONY: all, test, test-e2e, test-init, srpm, rpm, clean, install, uninstall
 
 # autocalculate software/package versions
 VERSION := $(shell grep Version onedriver.spec | sed 's/Version: *//g')
@@ -68,7 +68,6 @@ v$(VERSION).tar.gz: $(shell git ls-files)
 	git rev-parse HEAD > .commit
 	echo .commit >> filelist.txt
 	rsync -a --files-from=filelist.txt . onedriver-$(VERSION)
-	mv onedriver-$(VERSION)/pkg/debian onedriver-$(VERSION)
 	go mod vendor
 	cp -R vendor/ onedriver-$(VERSION)
 	tar -czf $@ onedriver-$(VERSION)
@@ -89,34 +88,17 @@ onedriver-$(RPM_FULL_VERSION).x86_64.rpm: onedriver-$(RPM_FULL_VERSION).src.rpm
 	cp /var/lib/mock/$(MOCK_CONFIG)/result/$@ .
 
 
-# create a release tarball for debian builds
-onedriver_$(VERSION).orig.tar.gz: v$(VERSION).tar.gz
-	cp $< $@
-
-
-# create the debian source package for the current version
-changes: onedriver_$(VERSION)-$(RELEASE)_source.changes
-onedriver_$(VERSION)-$(RELEASE)_source.changes: onedriver_$(VERSION).orig.tar.gz
-	cd onedriver-$(VERSION) && debuild -S -sa -d
-
-
-# just a helper target to use while building debs
-dsc: onedriver_$(VERSION)-$(RELEASE).dsc
-onedriver_$(VERSION)-$(RELEASE).dsc: onedriver_$(VERSION).orig.tar.gz
-	dpkg-source --build onedriver-$(VERSION)
-
-
-# create the debian package in a chroot via pbuilder
-deb: onedriver_$(VERSION)-$(RELEASE)_amd64.deb
-onedriver_$(VERSION)-$(RELEASE)_amd64.deb: onedriver_$(VERSION)-$(RELEASE).dsc
-	sudo mkdir -p /var/cache/pbuilder/aptcache
-	sudo pbuilder --build $<
-	cp /var/cache/pbuilder/result/$@ .
-
-
 # a large text file for us to test upload sessions with. #science
 dmel.fa:
 	curl ftp://ftp.ensemblgenomes.org/pub/metazoa/release-42/fasta/drosophila_melanogaster/dna/Drosophila_melanogaster.BDGP6.22.dna.chromosome.X.fa.gz | zcat > $@
+
+
+# tests that need no OneDrive account: unit tests plus the end-to-end suite,
+# which mounts onedriver against a fake Graph API (needs /dev/fuse)
+test-e2e:
+	go test -race -count=1 ./cmd/common ./fs/graph/quickxorhash ./fs/quota/... ./fs/partial/...
+	$(CGO_CFLAGS) go test -race -c -o e2e.test ./fs/e2e
+	./e2e.test -test.v -test.count=1
 
 
 # setup tests for the first time on a new computer
@@ -147,6 +129,6 @@ test: onedriver onedriver-launcher dmel.fa
 # all files tests depend on, all auth tokens... EVERYTHING
 clean:
 	fusermount3 -uz mount/ || true
-	rm -f *.db *.rpm *.deb *.dsc *.changes *.build* *.upload *.xz filelist.txt .commit
+	rm -f *.db *.rpm *.xz filelist.txt .commit
 	rm -f *.log *.fa *.gz *.test vgcore.* onedriver onedriver-headless onedriver-launcher .auth_tokens.json
 	rm -rf util-linux-*/ onedriver-*/ vendor/ build/

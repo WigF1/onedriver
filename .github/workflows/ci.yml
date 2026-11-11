@@ -1,114 +1,42 @@
-name: Run tests
-on: push
+name: Tests
+on:
+  push:
+  pull_request:
+
+# Runs everything that works without a OneDrive account: formatting, vet,
+# a full cgo build, unit tests and the end-to-end suite (fs/e2e), which
+# mounts onedriver through FUSE against a fake Graph API. The live tests in
+# ./fs, ./fs/graph and ./fs/offline need a signed-in account and are run by
+# hand ("make test").
 jobs:
   test:
-    name: Run tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        account_type:
-          - personal
-          - business
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.25"
+          go-version: stable
 
-      - name: Install apt dependencies
+      - name: Install dependencies
         run: |
-          sudo apt update
-          sudo apt install \
-            gcc \
-            pkg-config \
-            libwebkit2gtk-4.1-dev \
-            libjson-glib-dev \
-            make \
-            wget \
-            rpm \
-            libreoffice
+          sudo apt-get update
+          sudo apt-get install -y gcc pkg-config libwebkit2gtk-4.1-dev libjson-glib-dev fuse3
 
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-go-
+      - name: Check formatting
+        run: test -z "$(gofmt -l cmd fs ui)" || (gofmt -l cmd fs ui; exit 1)
 
-      - name: Check go formatting
+      - name: Build
+        run: make onedriver onedriver-launcher
+
+      - name: Vet
+        run: CGO_CFLAGS=-Wno-deprecated-declarations go vet ./cmd/... ./fs/... ./ui/...
+
+      - name: Unit tests
+        run: go test -race -count=1 ./cmd/common ./fs/graph/quickxorhash ./fs/quota/... ./fs/partial/...
+
+      - name: End-to-end tests (FUSE, fake Graph API)
         run: |
-          go install golang.org/x/tools/cmd/goimports@latest
-          goimports -l .
-
-      - name: Copy auth tokens from S3
-        run: |
-          which aws
-          aws --version
-          aws s3 cp s3://fusefs-travis/$ACCOUNT_TYPE/.auth_tokens.json .
-          aws s3 cp s3://fusefs-travis/dmel.fa.gz .
-          gunzip dmel.fa.gz
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          ACCOUNT_TYPE: ${{ matrix.account_type }}
-
-      - name: Run tests
-        run: |
-          go install github.com/rakyll/gotest@latest
-          # cannot run systemd tests here because github actions runners don't have dbus setup +
-          # if CGO is on, the UI tests will take foreverrrrr
-          bash cgo-helper.sh
-          CGO_ENABLED=0 gotest -v -tags=glib_2_64 -covermode=count -coverpkg=./ui/... -coverprofile=ui.coverage ./ui
-          gotest -v -tags=glib_2_64 -covermode=count -coverpkg=./cmd/common -coverprofile=common.coverage ./cmd/common
-          gotest -v -tags=glib_2_64 -covermode=count -coverpkg=./fs/... -coverprofile=quickxorhash.coverage ./fs/graph/quickxorhash
-          gotest -v -tags=glib_2_64 -covermode=count -coverpkg=./fs/... -coverprofile=graph.coverage ./fs/graph
-          gotest -v -tags=glib_2_64 -covermode=count -coverpkg=./fs/... -coverprofile=fs.coverage ./fs
-          go test -c -tags=glib_2_64 -covermode=count -coverpkg=./fs/... ./fs/offline
-          sudo unshare -n -S $(id -u) -G $(id -g) ./offline.test -test.v -test.coverprofile=offline.coverage
-
-      - name: Copy new auth tokens to S3
-        run: |
-          aws s3 cp .auth_tokens.json s3://fusefs-travis/$ACCOUNT_TYPE/
-          aws s3 cp fusefs_tests.log s3://fusefs-travis/$ACCOUNT_TYPE/
-        env:
-          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          ACCOUNT_TYPE: ${{ matrix.account_type }}
-        if: always()
-
-      - name: Combine test coverage into single file
-        run: |
-          go install github.com/wadey/gocovmerge@latest
-          gocovmerge *.coverage > coverage.out
-        if: always()
-
-      - name: Convert coverage to lcov
-        uses: jandelgado/gcov2lcov-action@v1.2.0
-        if: always()
-
-      - name: Send test coverage to Coveralls
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          path-to-lcov: coverage.lcov
-          flag-name: ${{ matrix.account_type }}
-          parallel: true
-        # decreased coverage isn't a failure
-        continue-on-error: true
-        if: always()
-  finish:
-    name: Complete Coveralls run
-    needs: test
-    if: always()
-    runs-on: ubuntu-latest
-    steps:
-      - name: Coveralls finished
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ secrets.github_token }}
-          parallel-finished: true
-        # decreased coverage isn't a failure
-        continue-on-error: true
+          CGO_CFLAGS=-Wno-deprecated-declarations go test -race -c -o e2e.test ./fs/e2e
+          sudo ./e2e.test -test.v -test.count=1
