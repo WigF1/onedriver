@@ -53,6 +53,7 @@ type UploadSession struct {
 	retries            int
 	recreate           bool // upload by parent ID + name instead of by (stale) item ID
 	recreated          bool // recreate was already tried for this session
+	discard            bool // deleted locally during the upload: delete the result
 
 	sync.Mutex
 	UploadURL string `json:"uploadUrl"`
@@ -352,4 +353,12 @@ func isItemNotFound(err error) bool {
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "itemNotFound") || strings.Contains(msg, "HTTP 404")
+}
+
+// createsItem reports whether this upload creates a new item on the server
+// (by parent and name) rather than updating an existing one by ID.
+func (u *UploadSession) createsItem() bool {
+	u.Lock()
+	defer u.Unlock()
+	return u.recreate || isLocalID(u.OldID)
 }
