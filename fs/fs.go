@@ -1,6 +1,7 @@
 package fs
 
 import (
+	"errors"
 	"math"
 	"os"
 	"path/filepath"
@@ -42,7 +43,23 @@ func (f *Filesystem) remoteID(i *Inode) (string, error) {
 
 	originalID := i.ID()
 	if isLocalID(originalID) && f.auth.Token() != "" {
-		// perform a blocking upload of the item
+		// The save that came just before this (an app writing a temp file and
+		// renaming it over the original) usually queued an upload already.
+		// Wait for that one instead of uploading the same file a second time:
+		// two uploads either left a duplicate under the temp name on the
+		// server or, for large files, collided and failed the save (#492).
+		if newID, found := f.uploads.WaitForUpload(originalID); found {
+			if newID == "" {
+				return originalID, errors.New("upload of " + originalID + " failed")
+			}
+			log.Info().
+				Str("originalID", originalID).
+				Str("newID", newID).
+				Msg("Got ID from the pending upload.")
+			return newID, nil
+		}
+
+		// nothing queued: perform a blocking upload of the item
 		data := f.getInodeContent(i)
 		session, err := NewUploadSession(i, data)
 		if err != nil {
@@ -935,10 +952,35 @@ func (f *Filesystem) Rename(cancel <-chan struct{}, in *fuse.RenameIn, name stri
 		return fuse.EREMOTEIO
 	}
 
+	// an existing file at the destination is replaced by the move (this is
+	// how atomic saves work: write a temp file, rename it over the original)
+	var replaced *Inode
+	if existing, _ := f.GetChild(newParentID, newName, f.auth); existing != nil &&
+		existing != inode && !existing.IsDir() {
+		replaced = existing
+	}
+
 	// perform remote rename
 	if err = graph.Rename(id, newName, newParentID, f.auth); err != nil {
 		ctx.Error().Err(err).Msg("Failed to rename remote item.")
 		return fuse.EREMOTEIO
+	}
+
+	if replaced != nil {
+		// The replaced item is gone on the server, so drop it locally too. A
+		// pending upload of it would only fail against an item that no
+		// longer exists. (Ported from leifrossau/onedriver.)
+		replacedID := replaced.ID()
+		ctx.Debug().Str("replacedID", replacedID).Msg("Rename replaced an existing item.")
+		if replaced.Name() != newName {
+			// Only the case differs (lookups are case insensitive): the
+			// kernel may still resolve the old spelling to this inode, so
+			// keep it until the delta loop removes it.
+			f.uploads.CancelUpload(replacedID)
+		} else {
+			f.DeleteID(replacedID)
+			f.content.Delete(replacedID)
+		}
 	}
 
 	// now rename local copy

@@ -17,6 +17,8 @@ var bucketUploads = []byte("uploads")
 type UploadManager struct {
 	queue         chan *UploadSession
 	deletionQueue chan string
+	waitQueue     chan uploadWait
+	waiters       map[string][]chan uploadResult // only touched by uploadLoop
 	sessions      map[string]*UploadSession
 	inFlight      uint8 // number of sessions in flight
 	auth          *graph.Auth
@@ -29,6 +31,8 @@ func NewUploadManager(duration time.Duration, db *bolt.DB, fs *Filesystem, auth 
 	manager := UploadManager{
 		queue:         make(chan *UploadSession),
 		deletionQueue: make(chan string, 1000), // FIXME - why does this chan need to be buffered now???
+		waitQueue:     make(chan uploadWait),
+		waiters:       make(map[string][]chan uploadResult),
 		sessions:      make(map[string]*UploadSession),
 		auth:          auth,
 		db:            db,
@@ -84,6 +88,20 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 		case cancelID := <-u.deletionQueue: // remove uploads for deleted items
 			u.finishUpload(cancelID)
 
+		case req := <-u.waitQueue: // someone needs the result of an upload now
+			session, exists := u.sessions[req.id]
+			if !exists {
+				req.done <- uploadResult{found: false}
+				continue
+			}
+			u.waiters[req.id] = append(u.waiters[req.id], req.done)
+			// start it right away instead of on the next tick
+			if session.getState() == uploadNotStarted &&
+				u.inFlight < maxUploadsInFlight && !u.auth.Expired() {
+				u.inFlight++
+				go session.Upload(u.auth)
+			}
+
 		case <-ticker.C: // periodically start uploads, or remove them if done/failed
 			for _, session := range u.sessions {
 				switch session.getState() {
@@ -101,6 +119,9 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 						// not the upload's fault: keep it, without counting a
 						// retry, until the user has logged in again
 						session.setState(uploadNotStarted, nil)
+						continue
+					}
+					if isItemNotFound(session.lastErr()) && u.handleNotFound(session) {
 						continue
 					}
 					session.retries++
@@ -152,6 +173,7 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 
 					// the old ID is the one that was used to add it to the queue.
 					// cleanup the session.
+					u.notifyWaiters(session.OldID, uploadResult{found: true, newID: session.ID})
 					u.finishUpload(session.OldID)
 				}
 			}
@@ -177,7 +199,41 @@ func (u *UploadManager) CancelUpload(id string) {
 // finishUpload is an internal method that gets called when a session is
 // completed. It cancels the session if one was in progress, and then deletes
 // it from both memory and disk.
+// uploadWait asks the upload loop to report when the upload of id is done.
+type uploadWait struct {
+	id   string
+	done chan uploadResult
+}
+
+// uploadResult is the outcome of WaitForUpload.
+type uploadResult struct {
+	found bool   // an upload for the item was queued or running
+	newID string // the item's ID after a successful upload, "" if it failed
+}
+
+// WaitForUpload waits until a queued or running upload of the item with the
+// given ID finishes, starting it immediately if it hasn't started yet. found
+// is false if there is no such upload. On success the item has already been
+// moved to its new (server) ID, which is returned.
+func (u *UploadManager) WaitForUpload(id string) (newID string, found bool) {
+	done := make(chan uploadResult, 1)
+	u.waitQueue <- uploadWait{id: id, done: done}
+	res := <-done
+	return res.newID, res.found
+}
+
+// notifyWaiters reports the outcome of an upload to WaitForUpload callers.
+// Only called from uploadLoop.
+func (u *UploadManager) notifyWaiters(id string, res uploadResult) {
+	for _, done := range u.waiters[id] {
+		done <- res
+	}
+	delete(u.waiters, id)
+}
+
 func (u *UploadManager) finishUpload(id string) {
+	// anyone still waiting gets "failed": the upload was cancelled or gave up
+	u.notifyWaiters(id, uploadResult{found: true})
 	if session, exists := u.sessions[id]; exists {
 		session.cancel(u.auth)
 	}
@@ -191,4 +247,48 @@ func (u *UploadManager) finishUpload(id string) {
 		u.inFlight--
 	}
 	delete(u.sessions, id)
+}
+
+// handleNotFound deals with an upload that failed because the server doesn't
+// know the item ID (404 itemNotFound), e.g. because an atomic save replaced
+// it. Only called from uploadLoop. Returns true if the session was dealt
+// with: dropped because the item no longer exists locally either (nothing is
+// lost), or reset to be created again by parent ID and name. Ported from
+// leifrossau/onedriver.
+func (u *UploadManager) handleNotFound(session *UploadSession) bool {
+	session.Lock()
+	id, oldID, recreated := session.ID, session.OldID, session.recreated
+	session.Unlock()
+	inode := u.fs.GetID(oldID)
+	if inode == nil {
+		inode = u.fs.GetID(id)
+	}
+	if inode == nil {
+		log.Debug().Str("id", id).Str("name", session.Name).
+			Msg("Upload target no longer exists locally, dropping the upload.")
+		u.finishUpload(oldID)
+		return true
+	}
+	if recreated || isLocalID(id) || inode.IsDir() {
+		return false
+	}
+	inode.RLock()
+	name := inode.DriveItem.Name
+	parentID := ""
+	if inode.DriveItem.Parent != nil {
+		parentID = inode.DriveItem.Parent.ID
+	}
+	inode.RUnlock()
+	if name == "" || parentID == "" {
+		return false
+	}
+	log.Warn().Str("id", id).Str("name", name).
+		Msg("The server does not know this item (anymore), creating it again by name.")
+	session.Lock()
+	session.recreate, session.recreated = true, true
+	session.Name, session.ParentID = name, parentID
+	session.Unlock()
+	session.cancel(u.auth)
+	session.setState(uploadNotStarted, nil)
+	return true
 }

@@ -51,6 +51,8 @@ type UploadSession struct {
 	QuickXORHash       string    `json:"quickxorhash,omitempty"`
 	ModTime            time.Time `json:"modTime,omitempty"`
 	retries            int
+	recreate           bool // upload by parent ID + name instead of by (stale) item ID
+	recreated          bool // recreate was already tried for this session
 
 	sync.Mutex
 	UploadURL string `json:"uploadUrl"`
@@ -190,6 +192,9 @@ func (u *UploadSession) uploadChunk(auth *graph.Auth, offset uint64) ([]byte, in
 // field contains errors to be handled if called as a goroutine.
 func (u *UploadSession) Upload(auth *graph.Auth) error {
 	log.Info().Str("id", u.ID).Str("name", u.Name).Msg("Uploading file.")
+	u.Lock()
+	byName := u.recreate || isLocalID(u.ID)
+	u.Unlock()
 	u.setState(uploadStarted, nil)
 
 	var uploadPath string
@@ -199,7 +204,7 @@ func (u *UploadSession) Upload(auth *graph.Auth) error {
 		// adding file modification times. We don't really care though, because
 		// after some experimentation, the Microsoft API doesn't seem to properly
 		// support these either (this is why we have to use etags).
-		if isLocalID(u.ID) {
+		if byName {
 			uploadPath = fmt.Sprintf(
 				"/me/drive/items/%s:/%s:/content",
 				url.PathEscape(u.ParentID),
@@ -223,7 +228,7 @@ func (u *UploadSession) Upload(auth *graph.Auth) error {
 			return u.setState(uploadErrored, fmt.Errorf("small upload failed: %w", err))
 		}
 	} else {
-		if isLocalID(u.ID) {
+		if byName {
 			uploadPath = fmt.Sprintf(
 				"/me/drive/items/%s:/%s:/createUploadSession",
 				url.PathEscape(u.ParentID),
@@ -300,7 +305,7 @@ func (u *UploadSession) Upload(auth *graph.Auth) error {
 			// the API frequently just returns a 0-byte response for completed
 			// multipart uploads, so we manually fetch the newly updated item
 			var remotePtr *graph.DriveItem
-			if isLocalID(u.ID) {
+			if byName {
 				remotePtr, err = graph.GetItemChild(u.ParentID, u.Name, auth)
 			} else {
 				remotePtr, err = graph.GetItem(u.ID, auth)
@@ -330,4 +335,21 @@ func (u *UploadSession) Upload(auth *graph.Auth) error {
 	u.ETag = remote.ETag
 	u.Unlock()
 	return u.setState(uploadComplete, nil)
+}
+
+// lastErr returns the error that made the upload fail, or nil.
+func (u *UploadSession) lastErr() error {
+	u.Lock()
+	defer u.Unlock()
+	return u.error
+}
+
+// isItemNotFound reports whether err means the server does not know the item
+// (anymore).
+func isItemNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "itemNotFound") || strings.Contains(msg, "HTTP 404")
 }
