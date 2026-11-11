@@ -137,8 +137,13 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 			http.DefaultClient.CloseIdleConnections()
 			return nil, nil, err
 		}
-		respBody, _ := io.ReadAll(response.Body)
+		respBody, err := io.ReadAll(response.Body)
 		response.Body.Close()
+		if err != nil {
+			// a truncated body must not be mistaken for a complete response
+			client.CloseIdleConnections()
+			return nil, nil, err
+		}
 		return response, respBody, nil
 	}
 

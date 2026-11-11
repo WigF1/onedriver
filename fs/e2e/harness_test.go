@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -26,18 +27,25 @@ import (
 
 const rootID = "ROOT"
 
-// fakeGraph is a minimal in-memory Graph API serving one folder of files.
+// fakeGraph is a minimal in-memory Graph API: files in the root folder and
+// in one level of subfolders. Paths look like "a.txt" or "Pictures/a.jpg";
+// item IDs are "id-" plus the path with "/" replaced by "~".
 type fakeGraph struct {
 	mu       sync.Mutex
-	files    map[string][]byte // name -> content
-	ranges   map[string]int    // name -> head range requests
-	fulls    map[string]int    // name -> full downloads
-	uploads  map[string][]byte // name -> last uploaded content
+	files    map[string][]byte // path -> content
+	folders  map[string]bool   // folder path (one level, no "/")
+	ranges   map[string]int    // path -> head range requests
+	fulls    map[string]int    // path -> full downloads
+	uploads  map[string][]byte // path -> last uploaded content
 	requests map[string]int    // request path -> count
 	throttle map[string][]int  // path prefix -> Retry-After seconds to answer 429 with, in order
 	deltas   []graph.DriveItem // returned by the next delta poll
 	rejected map[string]bool   // access tokens answered with HTTP 401
 	modTime  time.Time
+
+	pageSize     int  // children are returned in pages of this size if > 0
+	corruptPages int  // this many listing pages after the first are invalid JSON
+	down         bool // drop every connection, as if the network were gone
 
 	// token endpoint behaviour: "" (issue new tokens), "500" or "invalid_grant"
 	tokenMode  string
@@ -66,6 +74,7 @@ func (g *fakeGraph) posts() int {
 func newFakeGraph() *fakeGraph {
 	return &fakeGraph{
 		files:    make(map[string][]byte),
+		folders:  make(map[string]bool),
 		ranges:   make(map[string]int),
 		fulls:    make(map[string]int),
 		uploads:  make(map[string][]byte),
@@ -76,16 +85,32 @@ func newFakeGraph() *fakeGraph {
 	}
 }
 
-func (g *fakeGraph) add(name string, content []byte) {
+func idOf(path string) string { return "id-" + strings.ReplaceAll(path, "/", "~") }
+
+func pathOf(id string) string {
+	return strings.ReplaceAll(strings.TrimPrefix(id, "id-"), "~", "/")
+}
+
+// add creates a file; a path "Folder/name" also creates the folder.
+func (g *fakeGraph) add(path string, content []byte) {
 	g.mu.Lock()
-	g.files[name] = content
+	g.files[path] = content
+	if i := strings.Index(path, "/"); i > 0 {
+		g.folders[path[:i]] = true
+	}
+	g.mu.Unlock()
+}
+
+func (g *fakeGraph) set(f func(g *fakeGraph)) {
+	g.mu.Lock()
+	f(g)
 	g.mu.Unlock()
 }
 
 // remove deletes a file on the "server" without sending a delta.
-func (g *fakeGraph) remove(name string) {
+func (g *fakeGraph) remove(path string) {
 	g.mu.Lock()
-	delete(g.files, name)
+	delete(g.files, path)
 	g.mu.Unlock()
 }
 
@@ -104,10 +129,10 @@ func (g *fakeGraph) throttleNext(prefix string, retryAfter ...int) {
 	g.mu.Unlock()
 }
 
-func (g *fakeGraph) counts(name string) (ranges, fulls int) {
+func (g *fakeGraph) counts(path string) (ranges, fulls int) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.ranges[name], g.fulls[name]
+	return g.ranges[path], g.fulls[path]
 }
 
 func (g *fakeGraph) requestCount(path string) int {
@@ -116,31 +141,62 @@ func (g *fakeGraph) requestCount(path string) int {
 	return g.requests[path]
 }
 
-func (g *fakeGraph) uploaded(name string) ([]byte, bool) {
+func (g *fakeGraph) uploaded(path string) ([]byte, bool) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	data, ok := g.uploads[name]
+	data, ok := g.uploads[path]
 	return data, ok
 }
 
-func (g *fakeGraph) item(name string) graph.DriveItem {
+// item returns the DriveItem for a path ("" is the root). Caller holds g.mu.
+func (g *fakeGraph) item(path string) graph.DriveItem {
 	mt := g.modTime
-	parent := &graph.DriveItemParent{ID: rootID, DriveType: graph.DriveTypePersonal}
-	if name == "" {
+	if path == "" {
 		return graph.DriveItem{ID: rootID, Name: "root", ModTime: &mt,
 			Parent: &graph.DriveItemParent{DriveID: "drive", DriveType: graph.DriveTypePersonal},
 			Folder: &graph.Folder{ChildCount: uint32(len(g.files))}}
 	}
-	if name == trashName() {
-		return graph.DriveItem{ID: "id-" + name, Name: name, ModTime: &mt,
+	parentID, name := rootID, path
+	if i := strings.LastIndex(path, "/"); i > 0 {
+		parentID, name = idOf(path[:i]), path[i+1:]
+	}
+	parent := &graph.DriveItemParent{ID: parentID, DriveType: graph.DriveTypePersonal}
+	if path == trashName() || g.folders[path] {
+		return graph.DriveItem{ID: idOf(path), Name: name, ModTime: &mt,
 			Parent: parent, Folder: &graph.Folder{}}
 	}
-	data := g.files[name]
+	data := g.files[path]
 	return graph.DriveItem{
-		ID: "id-" + name, Name: name, Size: uint64(len(data)), ModTime: &mt,
-		Parent: parent, ETag: "etag-" + name + "-" + strconv.Itoa(len(data)),
+		ID: idOf(path), Name: name, Size: uint64(len(data)), ModTime: &mt,
+		Parent: parent, ETag: "etag-" + path + "-" + strconv.Itoa(len(data)),
 		File: &graph.File{Hashes: graph.Hashes{QuickXorHash: graph.QuickXORHash(&data)}},
 	}
+}
+
+// children lists a folder ("" is the root), sorted. Caller holds g.mu.
+func (g *fakeGraph) children(folder string) []graph.DriveItem {
+	var paths []string
+	if folder == "" {
+		paths = append(paths, trashName())
+		for f := range g.folders {
+			paths = append(paths, f)
+		}
+	}
+	for p := range g.files {
+		dir := ""
+		if i := strings.LastIndex(p, "/"); i > 0 {
+			dir = p[:i]
+		}
+		if dir == folder {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	items := make([]graph.DriveItem, 0, len(paths))
+	for _, p := range paths {
+		items = append(items, g.item(p))
+	}
+	return items
 }
 
 func trashName() string { return fmt.Sprintf(".Trash-%d", os.Getuid()) }
@@ -158,6 +214,15 @@ func notFound(w http.ResponseWriter) {
 func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.down {
+		// close the connection without an HTTP response: looks like no network
+		if hj, ok := w.(http.Hijacker); ok {
+			if conn, _, err := hj.Hijack(); err == nil {
+				conn.Close()
+				return
+			}
+		}
+	}
 	p := strings.TrimPrefix(r.URL.Path, "/v1.0")
 	g.requests[p]++
 	if g.rejected[strings.TrimPrefix(r.Header.Get("Authorization"), "bearer ")] {
@@ -176,11 +241,12 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	const items = "/me/drive/items/"
 	switch {
 	case p == "/me/drive":
 		writeJSON(w, graph.Drive{ID: "drive", DriveType: graph.DriveTypePersonal,
 			Quota: graph.DriveQuota{Total: 1 << 40, Remaining: 1 << 39}})
-	case p == "/me/drive/root" || p == "/me/drive/items/"+rootID:
+	case p == "/me/drive/root" || p == items+rootID:
 		writeJSON(w, g.item(""))
 	case strings.HasPrefix(p, "/me/drive/root/delta"):
 		deltas := g.deltas
@@ -192,22 +258,32 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"@odata.deltaLink": graph.GraphURL + "/me/drive/root/delta?token=next",
 			"value":            deltas,
 		})
-	case p == "/me/drive/items/"+rootID+"/children":
-		children := []graph.DriveItem{g.item(trashName())}
-		for name := range g.files {
-			children = append(children, g.item(name))
+	case strings.HasPrefix(p, items) && strings.HasSuffix(p, "/children"):
+		id := strings.TrimSuffix(strings.TrimPrefix(p, items), "/children")
+		folder := ""
+		if id != rootID {
+			folder = pathOf(id)
+			if !g.folders[folder] && folder != trashName() {
+				notFound(w)
+				return
+			}
 		}
-		writeJSON(w, map[string]interface{}{"value": children})
-	case r.Method == "PUT" && strings.HasPrefix(p, "/me/drive/items/"+rootID+":/"):
+		g.serveChildren(w, r, p, g.children(folder))
+	case r.Method == "PUT" && strings.HasPrefix(p, items) && strings.Contains(p, ":/") &&
+		strings.HasSuffix(p, ":/content"):
 		// small upload of a new file: /me/drive/items/{parent}:/{name}:/content
-		name := strings.TrimSuffix(strings.TrimPrefix(p, "/me/drive/items/"+rootID+":/"), ":/content")
-		g.storeUpload(w, r, name)
-	case r.Method == "PUT" && strings.HasPrefix(p, "/me/drive/items/id-") && strings.HasSuffix(p, "/content"):
-		name := strings.TrimSuffix(strings.TrimPrefix(p, "/me/drive/items/id-"), "/content")
-		g.storeUpload(w, r, name)
-	case strings.HasPrefix(p, "/me/drive/items/id-") && strings.HasSuffix(p, "/content"):
-		name := strings.TrimSuffix(strings.TrimPrefix(p, "/me/drive/items/id-"), "/content")
-		data, ok := g.files[name]
+		rest := strings.TrimSuffix(strings.TrimPrefix(p, items), ":/content")
+		parts := strings.SplitN(rest, ":/", 2)
+		path := parts[1]
+		if parts[0] != rootID {
+			path = pathOf(parts[0]) + "/" + parts[1]
+		}
+		g.storeUpload(w, r, path)
+	case r.Method == "PUT" && strings.HasPrefix(p, items+"id-") && strings.HasSuffix(p, "/content"):
+		g.storeUpload(w, r, pathOf(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content")))
+	case strings.HasPrefix(p, items+"id-") && strings.HasSuffix(p, "/content"):
+		path := pathOf(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content"))
+		data, ok := g.files[path]
 		if !ok {
 			notFound(w)
 			return
@@ -219,34 +295,59 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				end = len(data) - 1
 			}
 			if start == 0 && end < len(data)-1 && end+1 == partial.HeadSize {
-				g.ranges[name]++
+				g.ranges[path]++
 			} else if start == 0 {
-				g.fulls[name]++ // first chunk of a multipart full download
+				g.fulls[path]++ // first chunk of a multipart full download
 			}
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
 			w.WriteHeader(http.StatusPartialContent)
 			w.Write(data[start : end+1])
 			return
 		}
-		g.fulls[name]++
+		g.fulls[path]++
 		w.Write(data)
-	case strings.HasPrefix(p, "/me/drive/items/id-"):
-		name := strings.TrimPrefix(p, "/me/drive/items/id-")
-		if _, ok := g.files[name]; !ok && name != trashName() {
+	case strings.HasPrefix(p, items+"id-"):
+		path := pathOf(strings.TrimPrefix(p, items))
+		if _, ok := g.files[path]; !ok && path != trashName() && !g.folders[path] {
 			notFound(w)
 			return
 		}
-		writeJSON(w, g.item(name))
+		writeJSON(w, g.item(path))
 	default:
 		http.Error(w, `{"error":{"code":"notImplemented","message":"`+p+`"}}`, 501)
 	}
 }
 
-func (g *fakeGraph) storeUpload(w http.ResponseWriter, r *http.Request, name string) {
+// serveChildren writes one page of a listing, with an @odata.nextLink when
+// paging is enabled. Caller holds g.mu.
+func (g *fakeGraph) serveChildren(w http.ResponseWriter, r *http.Request, p string, all []graph.DriveItem) {
+	if g.pageSize <= 0 {
+		writeJSON(w, map[string]interface{}{"value": all})
+		return
+	}
+	skip, _ := strconv.Atoi(r.URL.Query().Get("$skiptoken"))
+	if skip > 0 && g.corruptPages > 0 {
+		g.corruptPages--
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"value": [ {"id": "trunc`))
+		return
+	}
+	end := skip + g.pageSize
+	if end > len(all) {
+		end = len(all)
+	}
+	page := map[string]interface{}{"value": all[skip:end]}
+	if end < len(all) {
+		page["@odata.nextLink"] = graph.GraphURL + p + "?$skiptoken=" + strconv.Itoa(end)
+	}
+	writeJSON(w, page)
+}
+
+func (g *fakeGraph) storeUpload(w http.ResponseWriter, r *http.Request, path string) {
 	data, _ := io.ReadAll(r.Body)
-	g.files[name] = data
-	g.uploads[name] = data
-	writeJSON(w, g.item(name))
+	g.files[path] = data
+	g.uploads[path] = data
+	writeJSON(w, g.item(path))
 }
 
 // fakeRouter is the single Graph endpoint for the whole test binary, so

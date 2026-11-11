@@ -307,6 +307,14 @@ func (f *Filesystem) InsertID(id string, inode *Inode) uint64 {
 		}
 	}
 
+	if parent.children == nil {
+		// The parent's listing was never fetched. Appending here would turn
+		// "not loaded" (nil) into a one-item list that looks complete, and
+		// the folder would then only show this item (#466, #215). The item
+		// is included when the listing is fetched from the server.
+		return nodeID
+	}
+
 	// add to parent
 	if inode.IsDir() {
 		parent.subdir++
@@ -424,7 +432,8 @@ func (f *Filesystem) GetChildrenID(id string, auth *graph.Auth) (map[string]*Ino
 	}
 
 	inode.Lock()
-	inode.children = make([]string, 0)
+	inode.children = make([]string, 0, len(fetched))
+	inode.subdir = 0 // recounted below, a concurrent fetch may have counted already
 	for _, item := range fetched {
 		// we will always have an id after fetching from the server
 		child := NewInodeDriveItem(item)
