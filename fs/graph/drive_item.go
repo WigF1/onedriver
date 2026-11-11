@@ -175,6 +175,15 @@ func GetItemContentStream(id string, auth *Auth, output io.Writer) (uint64, erro
 	return n, nil
 }
 
+// GetItemContentRange fetches bytes [start, end] (inclusive) of an item's
+// content with a single range request.
+func GetItemContentRange(id string, auth *Auth, start, end uint64) ([]byte, error) {
+	return Get(fmt.Sprintf("/me/drive/items/%s/content", id), auth, Header{
+		key:   "Range",
+		value: fmt.Sprintf("bytes=%d-%d", start, end),
+	})
+}
+
 // Remove removes a directory or file by ID
 func Remove(id string, auth *Auth) error {
 	return Delete("/me/drive/items/"+id, auth)

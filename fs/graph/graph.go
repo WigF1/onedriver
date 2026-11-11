@@ -18,7 +18,7 @@ import (
 )
 
 // GraphURL is the API endpoint of Microsoft Graph
-const GraphURL = "https://graph.microsoft.com/v1.0"
+var GraphURL = "https://graph.microsoft.com/v1.0"
 
 // graphError is an internal struct used when decoding Graph's error messages
 type graphError struct {

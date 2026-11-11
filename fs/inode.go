@@ -11,6 +11,7 @@ import (
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/jstaf/onedriver/fs/graph"
+	"github.com/jstaf/onedriver/fs/partial"
 )
 
 // Inode represents a file or folder fetched from the Graph API. All struct
@@ -29,6 +30,23 @@ type Inode struct {
 	hasChanges bool     // used to trigger an upload on flush
 	subdir     uint32   // used purely by NLink()
 	mode       uint32   // do not set manually
+
+	// needsDownload is set when a read-only Open found no valid cached content
+	// and deferred the download; reads must not use the cache file until the
+	// full download in ensureContent has cleared it.
+	needsDownload bool
+	// head serves reads near the start of the file while needsDownload is set
+	head partial.Buffer
+	// verified remembers the cache file state whose checksum last matched, so
+	// reopening a cached file doesn't re-hash it.
+	verified verifiedContent
+}
+
+// verifiedContent identifies a cache file whose checksum has been verified.
+type verifiedContent struct {
+	hash  string
+	size  int64
+	mtime time.Time
 }
 
 // SerializeableInode is like a Inode, but can be serialized for local storage
