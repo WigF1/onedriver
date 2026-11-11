@@ -105,7 +105,9 @@ func main() {
 			Str("mountpoint", mountpoint).
 			Msg("Mountpoint did not exist or was not a directory.")
 	}
-	if res, _ := os.ReadDir(mountpoint); len(res) > 0 {
+	// --auth-only is meant to be run while the mount is up (to log in again
+	// after a login expired), so the mountpoint is allowed to be in use then
+	if res, _ := os.ReadDir(mountpoint); len(res) > 0 && !*authOnly {
 		log.Fatal().Str("mountpoint", mountpoint).Msg("Mountpoint must be empty.")
 	}
 
@@ -117,8 +119,13 @@ func main() {
 	os.MkdirAll(cachePath, 0700)
 	authPath := filepath.Join(cachePath, "auth_tokens.json")
 	if *authOnly {
-		os.Remove(authPath)
-		graph.Authenticate(config.AuthConfig, authPath, *headless)
+		// Log in again unconditionally. The token file is only replaced once
+		// the login succeeded, so a cancelled login keeps the old one; a
+		// running mount of this mountpoint picks up the new login by itself.
+		graph.NoLoginWindow = *headless
+		graph.ForceLogin(config.AuthConfig, authPath, *headless)
+		log.Info().Msg("Logged in. A running mount of this mountpoint will use " +
+			"the new login within a few seconds.")
 		os.Exit(0)
 	}
 
