@@ -1,4 +1,4 @@
-.PHONY: all, test, test-e2e, test-init, srpm, rpm, clean, install, uninstall
+.PHONY: all, test, test-e2e, test-init, tarball, srpm, rpm, rpm-local, clean, install, uninstall
 
 # autocalculate software/package versions
 VERSION := $(shell grep Version onedriver.spec | sed 's/Version: *//g')
@@ -60,8 +60,9 @@ uninstall:
 	mandb
 
 
-# used to create release tarball for rpmbuild
-v$(VERSION).tar.gz: $(shell git ls-files)
+# release tarball for rpmbuild: the sources plus vendored Go modules, so the
+# RPM builds without network access
+onedriver-$(VERSION).tar.gz: $(shell git ls-files)
 	rm -rf onedriver-$(VERSION)
 	mkdir -p onedriver-$(VERSION)
 	git ls-files > filelist.txt
@@ -75,9 +76,19 @@ v$(VERSION).tar.gz: $(shell git ls-files)
 
 # build srpm package used for rpm build with mock
 srpm: onedriver-$(RPM_FULL_VERSION).src.rpm 
-onedriver-$(RPM_FULL_VERSION).src.rpm: v$(VERSION).tar.gz
+onedriver-$(RPM_FULL_VERSION).src.rpm: onedriver-$(VERSION).tar.gz
 	rpmbuild -ts $<
 	cp $$(rpm --eval '%{_topdir}')/SRPMS/$@ .
+
+
+tarball: onedriver-$(VERSION).tar.gz
+
+
+# build the rpm directly with rpmbuild on this machine (needs the
+# BuildRequires from onedriver.spec and rpm-build installed)
+rpm-local: onedriver-$(VERSION).tar.gz
+	rpmbuild -ta $<
+	cp $$(rpm --eval '%{_rpmdir}')/x86_64/onedriver-$(RPM_FULL_VERSION).x86_64.rpm .
 
 
 # build the rpm for the default mock target
@@ -129,6 +140,6 @@ test: onedriver onedriver-launcher dmel.fa
 # all files tests depend on, all auth tokens... EVERYTHING
 clean:
 	fusermount3 -uz mount/ || true
-	rm -f *.db *.rpm *.xz filelist.txt .commit
+	rm -f *.db *.rpm *.xz *.tar.gz filelist.txt .commit
 	rm -f *.log *.fa *.gz *.test vgcore.* onedriver onedriver-headless onedriver-launcher .auth_tokens.json
 	rm -rf util-linux-*/ onedriver-*/ vendor/ build/
