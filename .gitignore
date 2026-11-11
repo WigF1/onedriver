@@ -39,15 +39,3 @@ vendor/
 # for tests on older linuxes
 util-linux*
 unshare
-
-# debian build stuff
-debian/debhelper-build-stamp
-debian/*.substvars
-debian/*.debhelper
-debian/files
-*.dsc
-*.deb
-*.changes
-*.build*
-*.upload
-*.tar.xz
