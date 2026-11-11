@@ -64,10 +64,19 @@ or straight from the release URL:
 sudo dnf install https://github.com/WigF1/onedriver/releases/download/vX.Y.Z/onedriver-X.Y.Z-1.fcNN.x86_64.rpm
 ```
 
-If you previously installed upstream onedriver from COPR, remove it first
-(`sudo dnf remove onedriver` and `sudo dnf copr disable jstaf/onedriver`), so a
-`dnf upgrade` doesn't replace this version. Your login and cache in
-`~/.cache/onedriver` and settings in `~/.config/onedriver` are kept.
+Pick the RPM matching your Fedora version (`rpm -E %fedora`). To update,
+install the newer release's RPM the same way. Before the first install:
+
+- If upstream onedriver from COPR is installed, remove it
+  (`sudo dnf remove onedriver && sudo dnf copr disable jstaf/onedriver`), so a
+  `dnf upgrade` doesn't replace this version.
+- If you installed with `sudo make install`, run `sudo make uninstall` in that
+  checkout: its systemd unit in `/etc/systemd/user` would override the
+  packaged one.
+
+Your login and cache in `~/.cache/onedriver` and settings in
+`~/.config/onedriver` are kept either way. [RELEASING.md](RELEASING.md)
+describes how releases are made.
 
 To build and install from source instead, see
 [Building from source](#building-from-source).

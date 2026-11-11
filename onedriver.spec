@@ -1,11 +1,16 @@
+# Go binaries: no separate debuginfo/debugsource packages
+%global debug_package %{nil}
+
 Name:          onedriver
-Version:       0.15.0
-Release:       4%{?dist}
+Version:       0.16.0
+Release:       1%{?dist}
 Summary:       A native Linux filesystem for Microsoft Onedrive
 
 License:       GPL-3.0-or-later
-URL:           https://github.com/jstaf/onedriver
-Source0:       https://github.com/jstaf/onedriver/archive/refs/tags/v%{version}.tar.gz
+URL:           https://github.com/WigF1/onedriver
+# release tarball with vendored Go modules, made by "make onedriver-VERSION.tar.gz"
+# and attached to each GitHub release
+Source0:       https://github.com/WigF1/onedriver/releases/download/v%{version}/%{name}-%{version}.tar.gz
 
 %if 0%{?suse_version}
 BuildRequires: go >= 1.17
@@ -21,6 +26,8 @@ BuildRequires: webkit2gtk3-devel
 BuildRequires: webkit2gtk4.1-devel
 %endif
 Requires: fuse3
+# the login window needs it to show the Microsoft Authenticator number
+Recommends: gstreamer1-plugins-good
 
 %description
 Onedriver is a native Linux filesystem for Microsoft Onedrive. Files and
@@ -75,6 +82,21 @@ cp pkg/resources/%{name}.1.gz %{buildroot}/usr/share/man/man1
 %attr(644, root, root) /usr/share/man/man1/%{name}.1.gz
 
 %changelog
+* Wed Nov 11 2026 WigF1 <WigF1@users.noreply.github.com> - 0.16.0
+- First release of the WigF1/onedriver fork.
+- Nautilus no longer freezes: free-space queries are cached, folder listings
+  are prefetched, and browsing doesn't download files (range requests for
+  file-type sniffing).
+- Reliable token renewal; an expired login keeps the mount up read-only, and
+  "onedriver --auth-only" works while mounted. Login window fixes for MFA and
+  blank pages (ported from leifrossau/onedriver).
+- Atomic saves (KeePassXC, LibreOffice) upload once and leave no temp or lock
+  files; edits before a rename are no longer lost.
+- Stable directory listings, no partial listings, remote edits and deletions
+  applied reliably, fail fast during network outages, Graph throttling
+  honoured, empty files uploaded, mtime updated on write, cached files open
+  offline, Turkish dotted I in file names.
+
 * Fri Jan 30 2026 Jeff Stafford <jeff.stafford@protonmail.com> - 0.15.0
 - Slight refresh of the onedriver UI to look nicer.
 - Fix an authentication bug (Microsoft changed the auth format and I was using a
