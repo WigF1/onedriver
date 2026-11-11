@@ -510,8 +510,12 @@ func (f *Filesystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 		Str("path", path).
 		Logger()
 
+	// Offline, the filesystem is read-only. Many apps (LibreOffice and other
+	// editors) open documents read-write even just to view them, so that is
+	// allowed for cached files and only the writes themselves are refused
+	// (#356). Opens that would change the file right away are refused here.
 	flags := int(in.Flags)
-	if flags&os.O_RDWR+flags&os.O_WRONLY > 0 && f.IsOffline() {
+	if (flags&os.O_WRONLY > 0 || flags&os.O_RDWR > 0 && flags&os.O_TRUNC > 0) && f.IsOffline() {
 		ctx.Warn().
 			Bool("readWrite", flags&os.O_RDWR > 0).
 			Bool("writeOnly", flags&os.O_WRONLY > 0).
@@ -686,6 +690,12 @@ func (f *Filesystem) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte
 		Logger()
 	ctx.Trace().Msg("")
 
+	if f.IsOffline() {
+		// read-only while offline, see Open
+		ctx.Warn().Msg("Refusing Write(), FS is offline.")
+		return 0, fuse.EROFS
+	}
+
 	// never write on top of content that was never downloaded
 	if status := f.ensureContent(inode, ctx); status != fuse.OK {
 		return 0, status
@@ -707,6 +717,10 @@ func (f *Filesystem) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte
 
 	st, _ := fd.Stat()
 	inode.DriveItem.Size = uint64(st.Size())
+	// writing changes the modification time, which build tools, editors and
+	// backup tools rely on (#201)
+	now := time.Now()
+	inode.DriveItem.ModTime = &now
 	inode.hasChanges = true
 	return uint32(n), fuse.OK
 }
@@ -811,6 +825,11 @@ func (f *Filesystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fu
 		Str("path", path).
 		Logger()
 
+	if _, valid := in.GetSize(); valid && f.IsOffline() {
+		ctx.Warn().Msg("Refusing truncate, FS is offline.")
+		return fuse.EROFS
+	}
+
 	// truncating to a non-zero size keeps existing content, so it must be
 	// downloaded first if Open deferred that
 	if size, valid := in.GetSize(); valid && size > 0 {
@@ -825,7 +844,7 @@ func (f *Filesystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fu
 		ctx.Info().
 			Str("subop", "utimens").
 			Time("oldMtime", *i.DriveItem.ModTime).
-			Time("newMtime", *i.DriveItem.ModTime).
+			Time("newMtime", mtime).
 			Msg("")
 		i.DriveItem.ModTime = &mtime
 	}
@@ -856,6 +875,10 @@ func (f *Filesystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fu
 		fd.Truncate(int64(size))
 		i.DriveItem.Size = size
 		i.hasChanges = true
+		if _, mtimeGiven := in.GetMTime(); !mtimeGiven {
+			now := time.Now()
+			i.DriveItem.ModTime = &now
+		}
 		// the cache file is now the authoritative content
 		i.needsDownload = false
 		i.head.Reset()

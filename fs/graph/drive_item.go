@@ -247,7 +247,13 @@ func getItemChildren(pollURL string, auth *Auth) ([]*DriveItem, error) {
 			return fetched, err
 		}
 		var pollResult driveChildren
-		json.Unmarshal(body, &pollResult)
+		if err := json.Unmarshal(body, &pollResult); err != nil {
+			// never return a partial listing as if it were complete (#466)
+			// formatted like an HTTP error so it isn't mistaken for being
+			// offline (which would show the folder as empty)
+			return fetched, fmt.Errorf("HTTP 200 - invalidResponse: "+
+				"could not decode folder listing page: %w", err)
+		}
 
 		// there can be multiple pages of 200 items each (default).
 		// continue to next interation if we have an @odata.nextLink value
