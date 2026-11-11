@@ -41,7 +41,7 @@ func (f *Filesystem) remoteID(i *Inode) (string, error) {
 	}
 
 	originalID := i.ID()
-	if isLocalID(originalID) && f.auth.AccessToken != "" {
+	if isLocalID(originalID) && f.auth.Token() != "" {
 		// perform a blocking upload of the item
 		data := f.getInodeContent(i)
 		session, err := NewUploadSession(i, data)

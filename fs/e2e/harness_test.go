@@ -36,7 +36,31 @@ type fakeGraph struct {
 	requests map[string]int    // request path -> count
 	throttle map[string][]int  // path prefix -> Retry-After seconds to answer 429 with, in order
 	deltas   []graph.DriveItem // returned by the next delta poll
+	rejected map[string]bool   // access tokens answered with HTTP 401
 	modTime  time.Time
+
+	// token endpoint behaviour: "" (issue new tokens), "500" or "invalid_grant"
+	tokenMode  string
+	tokenDelay time.Duration
+	tokenPosts int
+}
+
+func (g *fakeGraph) setTokenMode(mode string, delay time.Duration) {
+	g.mu.Lock()
+	g.tokenMode, g.tokenDelay = mode, delay
+	g.mu.Unlock()
+}
+
+func (g *fakeGraph) reject(token string) {
+	g.mu.Lock()
+	g.rejected[token] = true
+	g.mu.Unlock()
+}
+
+func (g *fakeGraph) posts() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.tokenPosts
 }
 
 func newFakeGraph() *fakeGraph {
@@ -47,6 +71,7 @@ func newFakeGraph() *fakeGraph {
 		uploads:  make(map[string][]byte),
 		requests: make(map[string]int),
 		throttle: make(map[string][]int),
+		rejected: make(map[string]bool),
 		modTime:  time.Now().Add(-time.Hour).UTC().Truncate(time.Second),
 	}
 }
@@ -135,6 +160,11 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer g.mu.Unlock()
 	p := strings.TrimPrefix(r.URL.Path, "/v1.0")
 	g.requests[p]++
+	if g.rejected[strings.TrimPrefix(r.Header.Get("Authorization"), "bearer ")] {
+		w.WriteHeader(http.StatusUnauthorized)
+		w.Write([]byte(`{"error":{"code":"InvalidAuthenticationToken","message":"expired"}}`))
+		return
+	}
 
 	for prefix, waits := range g.throttle {
 		if strings.HasPrefix(p, prefix) && len(waits) > 0 {
@@ -247,7 +277,51 @@ func (r *fakeRouter) unregister(token string) {
 	r.mu.Unlock()
 }
 
+// tokenURL is the fake OAuth token endpoint for the fakeGraph that the
+// access token belongs to.
+func (r *fakeRouter) tokenURL(token string) string {
+	return graph.GraphURL[:len(graph.GraphURL)-len("/v1.0")] + "/oauth/" + token + "/token"
+}
+
+// handleToken serves the OAuth token endpoint: refresh_token grants get a new
+// access + refresh token pair registered to the same fakeGraph.
+func (r *fakeRouter) handleToken(w http.ResponseWriter, req *http.Request) {
+	key := strings.TrimSuffix(strings.TrimPrefix(req.URL.Path, "/oauth/"), "/token")
+	r.mu.Lock()
+	g := r.graphs[key]
+	r.mu.Unlock()
+	if g == nil {
+		http.Error(w, "unknown", http.StatusServiceUnavailable)
+		return
+	}
+	req.ParseForm()
+	g.mu.Lock()
+	g.tokenPosts++
+	mode, delay := g.tokenMode, g.tokenDelay
+	g.mu.Unlock()
+	time.Sleep(delay)
+	switch mode {
+	case "500":
+		http.Error(w, `{"error":"server_error"}`, http.StatusInternalServerError)
+		return
+	case "invalid_grant":
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(`{"error":"invalid_grant","error_description":"AADSTS70000: grant expired"}`))
+		return
+	}
+	access := r.register(g)
+	writeJSON(w, map[string]interface{}{
+		"access_token":  access,
+		"refresh_token": "refresh-for-" + access,
+		"expires_in":    3600,
+	})
+}
+
 func (r *fakeRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if strings.HasPrefix(req.URL.Path, "/oauth/") {
+		r.handleToken(w, req)
+		return
+	}
 	token := strings.TrimPrefix(req.Header.Get("Authorization"), "bearer ")
 	r.mu.Lock()
 	g := r.graphs[token]
@@ -272,8 +346,11 @@ type options struct {
 }
 
 type mounted struct {
-	dir string
-	fs  *fs.Filesystem
+	dir       string
+	fs        *fs.Filesystem
+	auth      *graph.Auth
+	tokenFile string
+	token     string // the initial access token
 }
 
 // mount starts a fake Graph server and mounts onedriver against it.
@@ -294,7 +371,19 @@ func mount(t *testing.T, g *fakeGraph, opts options) mounted {
 	dir := t.TempDir()
 	mnt := filepath.Join(dir, "mount")
 	os.Mkdir(mnt, 0755)
-	auth := &graph.Auth{AccessToken: token, ExpiresAt: time.Now().Add(time.Hour).Unix()}
+	auth := &graph.Auth{
+		AuthConfig: graph.AuthConfig{
+			ClientID: "test", RedirectURL: "https://example.invalid/redirect",
+			TokenURL: router.tokenURL(token), CodeURL: "https://example.invalid/code",
+		},
+		AccessToken:  token,
+		RefreshToken: "refresh-for-" + token,
+		ExpiresAt:    time.Now().Add(time.Hour).Unix(),
+	}
+	tokenFile := filepath.Join(dir, "auth_tokens.json")
+	if err := auth.ToFile(tokenFile); err != nil {
+		t.Fatal(err)
+	}
 	filesystem := fs.NewFilesystem(auth, filepath.Join(dir, "cache"))
 	if opts.deltaInterval > 0 {
 		go filesystem.DeltaLoop(opts.deltaInterval)
@@ -314,7 +403,7 @@ func mount(t *testing.T, g *fakeGraph, opts options) mounted {
 			exec.Command("fusermount3", "-uz", mnt).Run()
 		}
 	})
-	return mounted{dir: mnt, fs: filesystem}
+	return mounted{dir: mnt, fs: filesystem, auth: auth, tokenFile: tokenFile, token: token}
 }
 
 // eventually polls cond until it returns true or the timeout passes.

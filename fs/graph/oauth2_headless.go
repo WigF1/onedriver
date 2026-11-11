@@ -4,6 +4,6 @@
 package graph
 
 // accountName arg is only present for compatibility with the non-headless C version.
-func getAuthCode(config AuthConfig, accountName string) string {
+func getAuthCode(config AuthConfig, accountName string) (string, error) {
 	return getAuthCodeHeadless(config, accountName)
 }

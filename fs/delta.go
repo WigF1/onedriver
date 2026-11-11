@@ -20,8 +20,28 @@ func (f *Filesystem) DeltaLoop(interval time.Duration) {
 		log.Trace().Msg("Fetching deltas from server.")
 		pollSuccess := false
 		deltas := make(map[string]*graph.DriveItem)
+
+		// Without a login nothing can be fetched. Stay offline (read-only,
+		// served from the cache) and check for a new login written by
+		// "onedriver --auth-only" instead of hammering the token endpoint.
+		if f.auth.Expired() && !f.auth.ReloadFromFile() {
+			f.Lock()
+			if !f.offline {
+				log.Warn().Msg(graph.AuthExpiredMessage + ": serving files read-only " +
+					"from the cache. " + graph.ReloginHint)
+			}
+			f.offline = true
+			f.Unlock()
+			time.Sleep(10 * time.Second)
+			continue
+		}
+
 		for {
 			incoming, cont, err := f.pollDeltas(f.auth)
+			if errors.Is(err, graph.ErrAuthExpired) {
+				// not the network's fault, the next round waits for a login
+				break
+			}
 			if err != nil {
 				// the only thing that should be able to bring the FS out
 				// of a read-only state is a successful delta call

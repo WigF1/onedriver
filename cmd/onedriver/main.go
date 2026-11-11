@@ -124,6 +124,7 @@ func main() {
 
 	// create the filesystem
 	log.Info().Msgf("onedriver %s", common.Version())
+	graph.NoLoginWindow = *headless
 	auth := graph.Authenticate(config.AuthConfig, authPath, *headless)
 	filesystem := fs.NewFilesystem(auth, cachePath)
 	go filesystem.DeltaLoop(30 * time.Second)
