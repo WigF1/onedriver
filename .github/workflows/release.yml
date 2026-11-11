@@ -84,6 +84,8 @@ jobs:
         with:
           tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*/*
-          # only used when the release is created; an existing release keeps
-          # its notes and gets the new or rebuilt files added
-          generate_release_notes: true
+          # Notes are generated only when a tag push creates the release. A
+          # manual run (adding RPMs to an existing release) must not set
+          # this: the action appends the generated notes to the existing
+          # ones, duplicating them.
+          generate_release_notes: ${{ github.event_name == 'push' }}
