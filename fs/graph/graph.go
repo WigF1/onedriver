@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -34,6 +36,52 @@ type graphError struct {
 // This is an additional header that can be specified to Request
 type Header struct {
 	key, value string
+}
+
+// Network timeouts. A connection that can't be opened, or a server that
+// doesn't start answering, fails within these instead of the old 60 s, so
+// filesystem operations don't hang applications for minutes when the
+// network is gone (#472). Variables so tests can shorten them; set them
+// before the first request.
+var (
+	ConnectTimeout  = 10 * time.Second // TCP connect and TLS handshake
+	ResponseTimeout = 30 * time.Second // until the response headers arrive
+	// NetworkDownFor is how long after a network-level failure requests from
+	// the filesystem are skipped (see NetworkDown) before trying again.
+	NetworkDownFor = 15 * time.Second
+)
+
+var (
+	transportOnce sync.Once
+	transport     *http.Transport
+)
+
+func sharedTransport() *http.Transport {
+	transportOnce.Do(func() {
+		transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   ConnectTimeout,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   ConnectTimeout,
+			ResponseHeaderTimeout: ResponseTimeout,
+			IdleConnTimeout:       90 * time.Second,
+			MaxIdleConnsPerHost:   8,
+			ForceAttemptHTTP2:     true,
+		}
+	})
+	return transport
+}
+
+// NetworkDown reports whether a request made with this Auth failed at the
+// network level (no HTTP response at all) within the last NetworkDownFor,
+// with no successful request since. The filesystem treats this like being
+// offline and answers from its cache instead of letting every operation wait
+// for its own timeout.
+func (a *Auth) NetworkDown() bool {
+	t := a.networkDownAt.Load()
+	return t != 0 && time.Since(time.Unix(0, t)) < NetworkDownFor
 }
 
 // throttledUntil is the unix-nanosecond time until which Graph has asked us
@@ -105,7 +153,7 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 		}
 	}
 
-	client := &http.Client{Timeout: 60 * time.Second}
+	client := &http.Client{Timeout: 60 * time.Second, Transport: sharedTransport()}
 	do := func() (*http.Response, []byte, error) {
 		var reader io.Reader
 		if body != nil {
@@ -135,8 +183,10 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 			// instead of hanging on them.
 			client.CloseIdleConnections()
 			http.DefaultClient.CloseIdleConnections()
+			auth.networkDownAt.Store(time.Now().UnixNano())
 			return nil, nil, err
 		}
+		auth.networkDownAt.Store(0)
 		respBody, err := io.ReadAll(response.Body)
 		response.Body.Close()
 		if err != nil {

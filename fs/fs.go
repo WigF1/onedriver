@@ -204,6 +204,14 @@ func (f *Filesystem) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string
 		ctx.Error().Err(err).Msg("Could not create remote directory!")
 		return fuse.EREMOTEIO
 	}
+	if item == nil || item.ID == "" {
+		// an unexpected response must not crash the whole filesystem
+		ctx.Error().Msg("Server response for the new directory has no item ID.")
+		return fuse.EREMOTEIO
+	}
+	if item.Parent == nil {
+		item.Parent = &graph.DriveItemParent{ID: id}
+	}
 
 	newInode := NewInodeDriveItem(item)
 	newInode.mode = in.Mode | fuse.S_IFDIR
@@ -289,7 +297,7 @@ func (f *Filesystem) dirEntries(dir *Inode, ctx zerolog.Logger) ([]*Inode, fuse.
 		parent.nodeID = math.MaxUint64
 	}
 
-	// children is keyed by lowercased name, which is unique per directory
+	// children is keyed by folded name (foldName), unique per directory
 	names := make([]string, 0, len(children))
 	for name := range children {
 		names = append(names, name)
@@ -415,7 +423,7 @@ func (f *Filesystem) Lookup(cancel <-chan struct{}, in *fuse.InHeader, name stri
 		Str("name", name).
 		Msg("")
 
-	child, _ := f.GetChild(id, strings.ToLower(name), f.auth)
+	child, _ := f.GetChild(id, name, f.auth)
 	if child == nil {
 		return fuse.ENOENT
 	}

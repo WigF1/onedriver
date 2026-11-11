@@ -59,6 +59,10 @@ type Auth struct {
 	refreshMu sync.Mutex   // serializes token renewals
 	loginBusy int32        // only one interactive login at a time (atomic)
 
+	// unix-nanosecond time of the last network-level request failure, 0
+	// after a success (see NetworkDown)
+	networkDownAt atomic.Int64
+
 	// transient renewal failure bookkeeping, protected by refreshMu
 	failures   int
 	nextRetry  time.Time

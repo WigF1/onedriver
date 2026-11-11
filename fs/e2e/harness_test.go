@@ -53,6 +53,7 @@ type fakeGraph struct {
 	pageSize     int  // children are returned in pages of this size if > 0
 	corruptPages int  // this many listing pages after the first are invalid JSON
 	down         bool // drop every connection, as if the network were gone
+	hang         bool // accept requests but never answer (TCP-level outage)
 
 	// token endpoint behaviour: "" (issue new tokens), "500" or "invalid_grant"
 	tokenMode  string
@@ -299,8 +300,12 @@ func notFound(w http.ResponseWriter) {
 
 func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	g.mu.Lock()
-	delay := g.uploadDelay
+	delay, hang := g.uploadDelay, g.hang
 	g.mu.Unlock()
+	if hang {
+		<-r.Context().Done() // until the client gives up
+		return
+	}
 	if delay > 0 && (r.Method == "PUT" || strings.HasSuffix(r.URL.Path, "/createUploadSession")) {
 		time.Sleep(delay) // a slow upload, still running when the app renames
 	}
@@ -350,6 +355,18 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"@odata.deltaLink": graph.GraphURL + "/me/drive/root/delta?token=next",
 			"value":            deltas,
 		})
+	case r.Method == "POST" && strings.HasPrefix(p, items) && strings.HasSuffix(p, "/children"):
+		// mkdir: {"name": ..., "folder": {}}
+		id := strings.TrimSuffix(strings.TrimPrefix(p, items), "/children")
+		var req graph.DriveItem
+		json.NewDecoder(r.Body).Decode(&req)
+		path := req.Name
+		if id != rootID {
+			path = g.pathFor(id) + "/" + req.Name
+		}
+		g.folders[path] = true
+		w.WriteHeader(http.StatusCreated)
+		writeJSON(w, g.item(path))
 	case strings.HasPrefix(p, items) && strings.HasSuffix(p, "/children"):
 		id := strings.TrimSuffix(strings.TrimPrefix(p, items), "/children")
 		folder := ""

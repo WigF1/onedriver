@@ -229,34 +229,58 @@ func (f *Filesystem) applyDelta(delta *graph.DriveItem) error {
 		// do not return, there may be additional changes
 	}
 
-	// Finally, check if the content/metadata of the remote has changed.
-	// "Interesting" changes must be synced back to our local state without
-	// data loss or corruption. Currently the only thing the local filesystem
-	// actually modifies remotely is the actual file data, so we simply accept
-	// the remote metadata changes that do not deal with the file's content
-	// changing.
-	if delta.ModTimeUnix() > local.ModTime() && !delta.ETagIsMatch(local.ETag) {
-		sameContent := false
-		if !delta.IsDir() && delta.File != nil {
-			local.RLock()
-			sameContent = local.VerifyChecksum(delta.File.Hashes.QuickXorHash)
-			local.RUnlock()
+	// Finally, check if the remote content or metadata changed. Only the
+	// file data is modified locally, so remote metadata is simply accepted.
+	if delta.IsDir() {
+		if delta.ModTimeUnix() > local.ModTime() && !delta.ETagIsMatch(local.ETag) {
+			local.Lock()
+			defer local.Unlock()
+			local.DriveItem.ModTime = delta.ModTime
+			local.DriveItem.ETag = delta.ETag
 		}
+		return nil
+	}
+	if !delta.ETagIsMatch(local.ETag) {
+		// A new server version is detected by its ETag and content hash,
+		// not by comparing the server's modification time with ours: that
+		// comparison depended on both clocks agreeing and ignored remote
+		// edits made "earlier" than a local write (#343).
+		sameContent := false
+		local.RLock()
+		if delta.File != nil {
+			sameContent = local.VerifyChecksum(delta.File.Hashes.QuickXorHash)
+		}
+		unsaved := local.hasChanges
+		local.RUnlock()
 
-		if !sameContent {
-			//TODO check if local has changes and rename the server copy if so
+		switch {
+		case sameContent:
+			// metadata-only change (or our own upload): remember the new ETag
+			local.Lock()
+			defer local.Unlock()
+			local.DriveItem.ETag = delta.ETag
+			if delta.ModTime != nil {
+				local.DriveItem.ModTime = delta.ModTime
+			}
+			return nil
+		case unsaved || f.uploads.IsUploadPending(id):
+			// Local changes that haven't reached the server yet win; they are
+			// uploaded next. (Overwriting here used to throw them away.)
+			ctx.Warn().Str("delta", "conflict").
+				Msg("Server copy changed while local changes are pending, keeping the local version.")
+			return nil
+		default:
 			ctx.Info().Str("delta", "overwrite").
 				Msg("Overwriting local item, no local changes to preserve.")
-			// update modtime, hashes, purge any local content in memory
+			// update modtime, hashes; the cached content no longer matches the
+			// hash and is downloaded again on the next open
 			local.Lock()
 			defer local.Unlock()
 			local.DriveItem.ModTime = delta.ModTime
 			local.DriveItem.Size = delta.Size
 			local.DriveItem.ETag = delta.ETag
-			// the rest of these are harmless when this is a directory
-			// as they will be null anyways
 			local.DriveItem.File = delta.File
-			local.hasChanges = false
+			local.head.Reset()
 			return nil
 		}
 	}

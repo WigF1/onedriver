@@ -2,6 +2,7 @@ package fs
 
 import (
 	"encoding/json"
+	"sync"
 	"time"
 
 	"github.com/jstaf/onedriver/fs/graph"
@@ -19,6 +20,7 @@ type UploadManager struct {
 	deletionQueue chan string
 	waitQueue     chan uploadWait
 	waiters       map[string][]chan uploadResult // only touched by uploadLoop
+	pending       sync.Map                       // IDs with a queued or running upload
 	sessions      map[string]*UploadSession
 	inFlight      uint8 // number of sessions in flight
 	auth          *graph.Auth
@@ -59,6 +61,7 @@ func NewUploadManager(duration time.Duration, db *bolt.DB, fs *Filesystem, auth 
 			}
 			session.cancel(auth) // uploads are currently non-resumable
 			manager.sessions[session.ID] = session
+			manager.pending.Store(session.ID, true)
 			return nil
 		})
 	})
@@ -84,6 +87,7 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 				return b.Put([]byte(session.ID), contents)
 			})
 			u.sessions[session.ID] = session
+			u.pending.Store(session.ID, true)
 
 		case cancelID := <-u.deletionQueue: // remove uploads for deleted items
 			session, exists := u.sessions[cancelID]
@@ -221,6 +225,9 @@ func (u *UploadManager) QueueUpload(inode *Inode) error {
 	data := u.fs.getInodeContent(inode)
 	session, err := NewUploadSession(inode, data)
 	if err == nil {
+		// marked before the hand-over so a delta arriving meanwhile can't
+		// mistake the item for having no local changes
+		u.pending.Store(session.ID, true)
 		u.queue <- session
 	}
 	return err
@@ -234,6 +241,13 @@ func (u *UploadManager) CancelUpload(id string) {
 // finishUpload is an internal method that gets called when a session is
 // completed. It cancels the session if one was in progress, and then deletes
 // it from both memory and disk.
+// IsUploadPending reports whether the item has a queued or running upload.
+// Safe to call from any goroutine.
+func (u *UploadManager) IsUploadPending(id string) bool {
+	_, ok := u.pending.Load(id)
+	return ok
+}
+
 // uploadWait asks the upload loop to report when the upload of id is done.
 type uploadWait struct {
 	id   string
@@ -282,6 +296,7 @@ func (u *UploadManager) finishUpload(id string) {
 		u.inFlight--
 	}
 	delete(u.sessions, id)
+	u.pending.Delete(id)
 }
 
 // handleNotFound deals with an upload that failed because the server doesn't
