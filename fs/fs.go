@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -16,6 +17,9 @@ import (
 )
 
 const timeout = time.Second
+
+// statfs is called constantly by file managers; only warn about quota quirks once
+var personalQuotaWarning, businessQuotaWarning sync.Once
 
 func (f *Filesystem) getInodeContent(i *Inode) *[]byte {
 	i.RLock()
@@ -119,18 +123,24 @@ func isNameRestricted(name string) bool {
 // quotas and storage limits.
 func (f *Filesystem) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
 	ctx := log.With().Str("op", "StatFs").Logger()
-	ctx.Debug().Msg("")
-	drive, err := graph.GetDrive(f.auth)
+	ctx.Trace().Msg("")
+	// served from cache so file managers calling statfs on their UI thread
+	// never wait on the network
+	drive, err := f.quota.Get()
 	if err != nil {
 		return fuse.EREMOTEIO
 	}
 
 	if drive.DriveType == graph.DriveTypePersonal {
-		ctx.Warn().Msg("Personal OneDrive accounts do not show number of files, " +
-			"inode counts reported by onedriver will be bogus.")
+		personalQuotaWarning.Do(func() {
+			ctx.Warn().Msg("Personal OneDrive accounts do not show number of files, " +
+				"inode counts reported by onedriver will be bogus.")
+		})
 	} else if drive.Quota.Total == 0 { // <-- check for if microsoft ever fixes their API
-		ctx.Warn().Msg("OneDrive for Business accounts do not report quotas, " +
-			"pretending the quota is 5TB and it's all unused.")
+		businessQuotaWarning.Do(func() {
+			ctx.Warn().Msg("OneDrive for Business accounts do not report quotas, " +
+				"pretending the quota is 5TB and it's all unused.")
+		})
 		drive.Quota.Total = 5 * uint64(math.Pow(1024, 4))
 		drive.Quota.Remaining = 5 * uint64(math.Pow(1024, 4))
 		drive.Quota.FileCount = 0

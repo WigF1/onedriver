@@ -15,6 +15,7 @@ import (
 	"github.com/jstaf/onedriver/cmd/common"
 	"github.com/jstaf/onedriver/fs"
 	"github.com/jstaf/onedriver/fs/graph"
+	"github.com/jstaf/onedriver/fs/quota"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	flag "github.com/spf13/pflag"
@@ -126,6 +127,8 @@ func main() {
 	auth := graph.Authenticate(config.AuthConfig, authPath, *headless)
 	filesystem := fs.NewFilesystem(auth, cachePath)
 	go filesystem.DeltaLoop(30 * time.Second)
+	// keeps the statfs quota cache and folder listings warm
+	go filesystem.BackgroundRefresh(quota.DefaultTTL)
 	xdgVolumeInfo(filesystem, auth)
 
 	server, err := fuse.NewServer(filesystem, mountpoint, &fuse.MountOptions{
