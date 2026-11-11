@@ -1,7 +1,6 @@
 package fs
 
 import (
-	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -511,7 +510,12 @@ func (f *Filesystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 		return fuse.OK
 	}
 
-	if inode.VerifyChecksum(graph.QuickXORHashStream(fd)) {
+	valid, err := f.cacheIsValid(inode, fd)
+	if err != nil {
+		ctx.Error().Err(err).Msg("Could not fetch file stats.")
+		return fuse.EIO
+	}
+	if valid {
 		// disk content is only used if the checksums match
 		ctx.Info().Msg("Found content in cache.")
 
@@ -522,34 +526,25 @@ func (f *Filesystem) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 			return fuse.EIO
 		}
 		inode.DriveItem.Size = uint64(st.Size())
+		inode.needsDownload = false
+		return fuse.OK
+	}
+
+	// Read-only opens don't download anything yet. File managers open files
+	// just to sniff their type from the first few KB, and downloading a whole
+	// large file for that blocks the folder from showing. Read() fetches what
+	// is actually needed. Offline, there is nothing to defer to.
+	readOnly := flags&(os.O_WRONLY|os.O_RDWR) == 0
+	if readOnly && !f.IsOffline() && contentHash(inode) != "" {
+		ctx.Info().Msg("Content not cached, deferring download until it is read.")
+		inode.needsDownload = true
 		return fuse.OK
 	}
 
 	ctx.Info().Msg(
 		"Not using cached item due to file hash mismatch, fetching content from API.",
 	)
-
-	// write to tempfile first to ensure our download is good
-	tempID := "temp-" + id
-	temp, err := f.content.Open(tempID)
-	if err != nil {
-		ctx.Error().Err(err).Msg("Failed to create tempfile for download.")
-		return fuse.EIO
-	}
-	defer f.content.Delete(tempID)
-
-	// replace content only on a match
-	size, err := graph.GetItemContentStream(id, f.auth, temp)
-	if err != nil || !inode.VerifyChecksum(graph.QuickXORHashStream(temp)) {
-		ctx.Error().Err(err).Msg("Failed to fetch remote content.")
-		return fuse.EREMOTEIO
-	}
-	temp.Seek(0, 0) // being explicit, even though already done in hashstream func
-	fd.Seek(0, 0)
-	fd.Truncate(0)
-	io.Copy(fd, temp)
-	inode.DriveItem.Size = size
-	return fuse.OK
+	return f.downloadLocked(inode, fd, ctx)
 }
 
 // Unlink deletes a child file.
@@ -607,16 +602,36 @@ func (f *Filesystem) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (
 		Logger()
 	ctx.Trace().Msg("")
 
-	fd, err := f.content.Open(id)
-	if err != nil {
-		ctx.Error().Err(err).Msg("Cache Open() failed.")
-		return fuse.ReadResultData(make([]byte, 0)), fuse.EIO
-	}
+	// a deferred download is completed (or a range request made) first; loop
+	// in case a concurrent Open deferred the download again in between
+	for attempt := 0; ; attempt++ {
+		data, served, status := f.readPending(inode, in, ctx)
+		if status != fuse.OK {
+			return fuse.ReadResultData(make([]byte, 0)), status
+		}
+		if served {
+			return fuse.ReadResultData(data), fuse.OK
+		}
 
-	// we are locked for the remainder of this op
-	inode.RLock()
-	defer inode.RUnlock()
-	return fuse.ReadResultFd(fd.Fd(), int64(in.Offset), int(in.Size)), fuse.OK
+		fd, err := f.content.Open(id)
+		if err != nil {
+			ctx.Error().Err(err).Msg("Cache Open() failed.")
+			return fuse.ReadResultData(make([]byte, 0)), fuse.EIO
+		}
+
+		// we are locked for the remainder of this op
+		inode.RLock()
+		if inode.needsDownload && attempt < 3 {
+			inode.RUnlock()
+			continue
+		}
+		defer inode.RUnlock()
+		if inode.needsDownload {
+			ctx.Error().Msg("Content still not downloaded after retries.")
+			return fuse.ReadResultData(make([]byte, 0)), fuse.EIO
+		}
+		return fuse.ReadResultFd(fd.Fd(), int64(in.Offset), int(in.Size)), fuse.OK
+	}
 }
 
 // Write to an Inode like a file. Note that changes are 100% local until
@@ -640,6 +655,11 @@ func (f *Filesystem) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte
 		Int("offset", offset).
 		Logger()
 	ctx.Trace().Msg("")
+
+	// never write on top of content that was never downloaded
+	if status := f.ensureContent(inode, ctx); status != fuse.OK {
+		return 0, status
+	}
 
 	fd, err := f.content.Open(id)
 	if err != nil {
@@ -754,14 +774,21 @@ func (f *Filesystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fu
 	}
 	path := i.Path()
 	isDir := i.IsDir() // holds an rlock
-	i.Lock()
-
 	ctx := log.With().
 		Str("op", "SetAttr").
 		Uint64("nodeID", in.NodeId).
-		Str("id", i.DriveItem.ID).
+		Str("id", i.ID()).
 		Str("path", path).
 		Logger()
+
+	// truncating to a non-zero size keeps existing content, so it must be
+	// downloaded first if Open deferred that
+	if size, valid := in.GetSize(); valid && size > 0 {
+		if status := f.ensureContent(i, ctx); status != fuse.OK {
+			return status
+		}
+	}
+	i.Lock()
 
 	// utimens
 	if mtime, valid := in.GetMTime(); valid {
@@ -799,6 +826,9 @@ func (f *Filesystem) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fu
 		fd.Truncate(int64(size))
 		i.DriveItem.Size = size
 		i.hasChanges = true
+		// the cache file is now the authoritative content
+		i.needsDownload = false
+		i.head.Reset()
 	}
 
 	i.Unlock()
