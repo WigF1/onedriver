@@ -73,6 +73,14 @@ func (f *Filesystem) PrefetchDirectories() {
 		inode.RLock()
 		cached := inode.children != nil
 		inode.RUnlock()
+		if !cached {
+			// leave the API alone while it is throttling us; interactive
+			// requests from the file manager need the headroom more
+			if wait := graph.ThrottledFor(); wait > 0 {
+				log.Info().Dur("wait", wait).Msg("Directory prefetch paused while throttled.")
+				time.Sleep(wait)
+			}
+		}
 
 		children, err := f.GetChildrenID(id, f.auth)
 		if err != nil {

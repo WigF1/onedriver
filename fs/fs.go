@@ -5,13 +5,16 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/jstaf/onedriver/fs/graph"
+	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
 
@@ -229,12 +232,36 @@ func (f *Filesystem) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.
 		Str("path", path).Logger()
 	ctx.Debug().Msg("")
 
-	children, err := f.GetChildrenID(id, f.auth)
+	entries, status := f.dirEntries(dir, ctx)
+	if status != fuse.OK {
+		return status
+	}
+	// each open handle gets its own snapshot of the listing, so concurrent
+	// readers of the same directory can't disturb each other's offsets
+	handle := atomic.AddUint64(&f.lastDirHandle, 1)
+	f.opendirsM.Lock()
+	f.opendirs[handle] = entries
+	f.opendirsM.Unlock()
+	if out != nil {
+		out.Fh = handle
+	}
+	return fuse.OK
+}
+
+// dirEntries builds a directory listing: ".", "..", then the children sorted
+// by name so every read of an unchanged directory returns the same order.
+func (f *Filesystem) dirEntries(dir *Inode, ctx zerolog.Logger) ([]*Inode, fuse.Status) {
+	children, err := f.GetChildrenID(dir.ID(), f.auth)
+	if graph.IsNotFound(err) {
+		ctx.Warn().Msg("Directory no longer exists on the server, removing it locally.")
+		go f.DeleteID(dir.ID())
+		return nil, fuse.ENOENT
+	}
 	if err != nil {
 		// not an item not found error (Lookup/Getattr will always be called
 		// before Readdir()), something has happened to our connection
 		ctx.Error().Err(err).Msg("Could not fetch children")
-		return fuse.EREMOTEIO
+		return nil, fuse.EREMOTEIO
 	}
 
 	parent := f.GetID(dir.ParentID())
@@ -245,41 +272,49 @@ func (f *Filesystem) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.
 		parent.nodeID = math.MaxUint64
 	}
 
-	entries := make([]*Inode, 2)
+	// children is keyed by lowercased name, which is unique per directory
+	names := make([]string, 0, len(children))
+	for name := range children {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	entries := make([]*Inode, 2, len(children)+2)
 	entries[0] = dir
 	entries[1] = parent
-
-	for _, child := range children {
-		entries = append(entries, child)
+	for _, name := range names {
+		entries = append(entries, children[name])
 	}
-	f.opendirsM.Lock()
-	f.opendirs[in.NodeId] = entries
-	f.opendirsM.Unlock()
+	return entries, fuse.OK
+}
 
-	return fuse.OK
+// openDirEntries returns the listing snapshot for a readdir request. Readdir
+// can arrive without a handle from OpenDir; a fresh listing is used then.
+func (f *Filesystem) openDirEntries(in *fuse.ReadIn) ([]*Inode, fuse.Status) {
+	f.opendirsM.RLock()
+	entries, ok := f.opendirs[in.Fh]
+	f.opendirsM.RUnlock()
+	if ok {
+		return entries, fuse.OK
+	}
+	dir := f.GetNodeID(in.NodeId)
+	if dir == nil {
+		return nil, fuse.EBADF
+	}
+	return f.dirEntries(dir, log.With().Str("op", "ReadDir").Uint64("nodeID", in.NodeId).Logger())
 }
 
 // ReleaseDir closes a directory and purges it from memory
 func (f *Filesystem) ReleaseDir(in *fuse.ReleaseIn) {
 	f.opendirsM.Lock()
-	delete(f.opendirs, in.NodeId)
+	delete(f.opendirs, in.Fh)
 	f.opendirsM.Unlock()
 }
 
 // ReadDirPlus reads an individual directory entry AND does a lookup.
 func (f *Filesystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	f.opendirsM.RLock()
-	entries, ok := f.opendirs[in.NodeId]
-	f.opendirsM.RUnlock()
-	if !ok {
-		// readdir can sometimes arrive before the corresponding opendir, so we force it
-		f.OpenDir(cancel, &fuse.OpenIn{InHeader: in.InHeader}, nil)
-		f.opendirsM.RLock()
-		entries, ok = f.opendirs[in.NodeId]
-		f.opendirsM.RUnlock()
-		if !ok {
-			return fuse.EBADF
-		}
+	entries, status := f.openDirEntries(in)
+	if status != fuse.OK {
+		return status
 	}
 
 	if in.Offset >= uint64(len(entries)) {
@@ -323,18 +358,9 @@ func (f *Filesystem) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *f
 // ReadDir reads a directory entry. Usually doesn't get called (ReadDirPlus is
 // typically used).
 func (f *Filesystem) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	f.opendirsM.RLock()
-	entries, ok := f.opendirs[in.NodeId]
-	f.opendirsM.RUnlock()
-	if !ok {
-		// readdir can sometimes arrive before the corresponding opendir, so we force it
-		f.OpenDir(cancel, &fuse.OpenIn{InHeader: in.InHeader}, nil)
-		f.opendirsM.RLock()
-		entries, ok = f.opendirs[in.NodeId]
-		f.opendirsM.RUnlock()
-		if !ok {
-			return fuse.EBADF
-		}
+	entries, status := f.openDirEntries(in)
+	if status != fuse.OK {
+		return status
 	}
 
 	if in.Offset >= uint64(len(entries)) {
@@ -416,6 +442,10 @@ func (f *Filesystem) Mknod(cancel <-chan struct{}, in *fuse.MknodIn, name string
 	}
 
 	inode := NewInode(name, in.Mode, parent)
+	// a new file exists on the server only once uploaded; without this an
+	// empty file (e.g. from touch) is never uploaded because nothing is
+	// ever written to it
+	inode.hasChanges = true
 	ctx.Debug().
 		Str("childID", inode.ID()).
 		Str("mode", Octal(in.Mode)).

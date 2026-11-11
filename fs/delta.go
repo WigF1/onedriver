@@ -133,21 +133,15 @@ func (f *Filesystem) applyDelta(delta *graph.DriveItem) error {
 
 	// diagnose and act on what type of delta we're dealing with
 
-	// do we have it at all?
-	if parent := f.GetID(parentID); parent == nil {
-		// Nothing needs to be applied, item not in cache, so latest copy will
-		// be pulled down next time it's accessed.
-		ctx.Trace().
-			Str("delta", "skip").
-			Msg("Skipping delta, item's parent not in cache.")
-		return nil
-	}
-
-	local := f.GetID(id)
-
-	// was it deleted?
+	// Deletions are matched by item ID alone: deleted items in a delta don't
+	// always carry a usable parent reference, and requiring the parent to be
+	// cached left remotely deleted files listed forever (#473).
 	if delta.Deleted != nil {
-		if delta.IsDir() && local != nil && local.HasChildren() {
+		local := f.GetID(id)
+		if local == nil {
+			return nil
+		}
+		if local.IsDir() && local.HasChildren() {
 			// from docs: you should only delete a folder locally if it is empty
 			// after syncing all the changes.
 			ctx.Warn().Str("delta", "delete").
@@ -159,6 +153,18 @@ func (f *Filesystem) applyDelta(delta *graph.DriveItem) error {
 		f.DeleteID(id)
 		return nil
 	}
+
+	// do we have it at all?
+	if parent := f.GetID(parentID); parent == nil {
+		// Nothing needs to be applied, item not in cache, so latest copy will
+		// be pulled down next time it's accessed.
+		ctx.Trace().
+			Str("delta", "skip").
+			Msg("Skipping delta, item's parent not in cache.")
+		return nil
+	}
+
+	local := f.GetID(id)
 
 	// does the item exist locally? if not, add the delta to the cache under the
 	// appropriate parent

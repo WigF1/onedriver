@@ -3,6 +3,7 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,9 +37,14 @@ type Filesystem struct {
 	lastNodeID uint64
 	inodes     []string
 
-	// tracks currently open directories
-	opendirsM sync.RWMutex
-	opendirs  map[uint64][]*Inode
+	// directory listing snapshots, keyed by the handle returned from OpenDir
+	opendirsM     sync.RWMutex
+	opendirs      map[uint64][]*Inode
+	lastDirHandle uint64
+
+	// hash of each item's last serialized form, see SerializeAll
+	serializedM sync.Mutex
+	serialized  map[string]uint64
 }
 
 // boltdb buckets
@@ -109,6 +115,7 @@ func NewFilesystem(auth *graph.Auth, cacheDir string) *Filesystem {
 		db:            db,
 		auth:          auth,
 		opendirs:      make(map[uint64][]*Inode),
+		serialized:    make(map[string]uint64),
 	}
 
 	rootItem, err := graph.GetItem("root", auth)
@@ -323,20 +330,30 @@ func (f *Filesystem) InsertChild(parentID string, child *Inode) uint64 {
 // be called before InsertID if being used to rename/move an item.
 func (f *Filesystem) DeleteID(id string) {
 	if inode := f.GetID(id); inode != nil {
-		parent := f.GetID(inode.ParentID())
-		parent.Lock()
-		for i, childID := range parent.children {
-			if childID == id {
-				parent.children = append(parent.children[:i], parent.children[i+1:]...)
-				if inode.IsDir() {
-					parent.subdir--
+		if parent := f.GetID(inode.ParentID()); parent != nil {
+			parent.Lock()
+			for i, childID := range parent.children {
+				if childID == id {
+					parent.children = append(parent.children[:i], parent.children[i+1:]...)
+					if inode.IsDir() {
+						parent.subdir--
+					}
+					break
 				}
-				break
 			}
+			parent.Unlock()
 		}
-		parent.Unlock()
 	}
 	f.metadata.Delete(id)
+	// also forget the on-disk copy, otherwise GetID's fallback to the
+	// database brings deleted items back (#473); a move re-inserts and
+	// re-serializes the item right after
+	f.serializedM.Lock()
+	delete(f.serialized, id)
+	f.serializedM.Unlock()
+	f.db.Batch(func(tx *bolt.Tx) error {
+		return tx.Bucket(bucketMetadata).Delete([]byte(id))
+	})
 	f.uploads.CancelUpload(id)
 }
 
@@ -563,21 +580,37 @@ func (f *Filesystem) MovePath(oldParent, newParent, oldName, newName string, aut
 	return nil
 }
 
-// SerializeAll dumps all inode metadata currently in the cache to disk. This
-// metadata is only used later if an item could not be found in memory AND the
-// cache is offline. Old metadata is not removed, only overwritten (to avoid an
-// offline session from wiping all metadata on a subsequent serialization).
-func (f *Filesystem) SerializeAll() {
-	log.Debug().Msg("Serializing cache metadata to disk.")
-
-	allItems := make(map[string][]byte)
+// SerializeAll writes inode metadata that changed since the last call to
+// disk, and returns how many items were written. This metadata is only used
+// later if an item could not be found in memory AND the cache is offline.
+// Items are removed from disk only by DeleteID, never by serialization (to
+// avoid an offline session from wiping all metadata on a subsequent
+// serialization).
+func (f *Filesystem) SerializeAll() int {
+	changed := make(map[string][]byte)
+	f.serializedM.Lock()
 	f.metadata.Range(func(k interface{}, v interface{}) bool {
 		// cannot occur within bolt transaction because acquiring the inode lock
 		// with AsJSON locks out other boltdb transactions
 		id := fmt.Sprint(k)
-		allItems[id] = v.(*Inode).AsJSON()
+		data := v.(*Inode).AsJSON()
+		// only items whose serialized form changed since the last write are
+		// written, so an idle filesystem doesn't rewrite the whole database
+		// every delta poll
+		sum := fnv.New64a()
+		sum.Write(data)
+		if h := sum.Sum64(); f.serialized[id] != h {
+			f.serialized[id] = h
+			changed[id] = data
+		}
 		return true
 	})
+	f.serializedM.Unlock()
+	if len(changed) == 0 {
+		log.Trace().Msg("No cache metadata changes to serialize.")
+		return 0
+	}
+	log.Debug().Int("items", len(changed)).Msg("Serializing cache metadata to disk.")
 
 	/*
 		One transaction to serialize them all,
@@ -585,16 +618,31 @@ func (f *Filesystem) SerializeAll() {
 		One transaction to bring them all
 		and in the darkness write them.
 	*/
-	f.db.Batch(func(tx *bolt.Tx) error {
+	err := f.db.Batch(func(tx *bolt.Tx) error {
 		b := tx.Bucket(bucketMetadata)
-		for k, v := range allItems {
-			b.Put([]byte(k), v)
+		for k, v := range changed {
+			if err := b.Put([]byte(k), v); err != nil {
+				return err
+			}
 			if k == f.root {
 				// root item must be updated manually (since there's actually
 				// two copies)
-				b.Put([]byte("root"), v)
+				if err := b.Put([]byte("root"), v); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
 	})
+	if err != nil {
+		// forget what was written so the next call retries these items
+		log.Error().Err(err).Msg("Failed to serialize cache metadata.")
+		f.serializedM.Lock()
+		for k := range changed {
+			delete(f.serialized, k)
+		}
+		f.serializedM.Unlock()
+		return 0
+	}
+	return len(changed)
 }
