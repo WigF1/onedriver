@@ -422,6 +422,13 @@ func newAuth(config AuthConfig, path string, headless bool) *Auth {
 	return auth
 }
 
+// ForceLogin runs the interactive login regardless of any saved tokens and
+// writes the new tokens to path once it succeeds (exiting on failure, like
+// the startup login). Used by "onedriver --auth-only".
+func ForceLogin(config AuthConfig, path string, headless bool) *Auth {
+	return newAuth(config, path, headless)
+}
+
 // StdinIsTerminal tells if onedriver was started interactively. Tests may
 // override it.
 var StdinIsTerminal = func() bool {
