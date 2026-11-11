@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"dario.cat/mergo"
 	"github.com/rs/zerolog/log"
 )
 
@@ -82,13 +81,20 @@ func retryAfter(response *http.Response, attempt int) time.Duration {
 
 // Request performs an authenticated request to Microsoft Graph
 func Request(resource string, auth *Auth, method string, content io.Reader, headers ...Header) ([]byte, error) {
-	if auth == nil || auth.AccessToken == "" {
+	if auth == nil || auth.Token() == "" {
+		if auth != nil && auth.Expired() {
+			return nil, ErrAuthExpired
+		}
 		// a catch all condition to avoid wiping our auth by accident
 		log.Error().Msg("Auth was empty and we attempted to make a request with it!")
 		return nil, errors.New("cannot make a request with empty auth")
 	}
 
-	auth.Refresh()
+	// transient renewal failures are not fatal: the old token may still work
+	if err := auth.refresh(""); errors.Is(err, ErrAuthExpired) {
+		return nil, err
+	}
+	token := auth.Token()
 
 	// buffer the body so the request can be re-sent on retries
 	var body []byte
@@ -109,7 +115,7 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 		if err != nil {
 			return nil, nil, err
 		}
-		request.Header.Add("Authorization", "bearer "+auth.AccessToken)
+		request.Header.Add("Authorization", "bearer "+token)
 		switch method { // request type-specific code here
 		case "PATCH":
 			request.Header.Add("If-Match", "*")
@@ -124,6 +130,11 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 		}
 		response, err := client.Do(request)
 		if err != nil {
+			// Connections kept alive from before a suspend or a network
+			// change are dead; make sure the next attempt opens new ones
+			// instead of hanging on them.
+			client.CloseIdleConnections()
+			http.DefaultClient.CloseIdleConnections()
 			return nil, nil, err
 		}
 		respBody, _ := io.ReadAll(response.Body)
@@ -163,13 +174,24 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 		log.Warn().
 			Str("code", gerr.Error.Code).
 			Str("message", gerr.Error.Message).
-			Msg("Authentication token invalid or new app permissions required, " +
-				"forcing reauth before retrying.")
+			Msg("Graph rejected the access token, trying to renew it.")
 
-		reauth := newAuth(auth.AuthConfig, auth.path, false)
-		mergo.Merge(auth, reauth, mergo.WithOverride)
-	}
-	if response.StatusCode >= 500 || response.StatusCode == 401 {
+		// Never log in interactively from here: this runs inside filesystem
+		// operations, often with no display (a systemd service), where the
+		// old code's login attempt killed onedriver and the mount with it.
+		// Renew the tokens and retry once; if the refresh token is rejected,
+		// the login is expired (see Auth.Expired).
+		switch rerr := auth.refresh(token); {
+		case errors.Is(rerr, ErrAuthExpired):
+			return nil, rerr
+		case rerr == nil:
+			token = auth.Token()
+			if response, respBody, err = do(); err != nil {
+				return nil, err
+			}
+		}
+		// otherwise the renewal failed transiently, report the 401 below
+	} else if response.StatusCode >= 500 {
 		// the onedrive API is having issues, retry once
 		if response, respBody, err = do(); err != nil {
 			return nil, err

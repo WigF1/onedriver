@@ -1,5 +1,6 @@
 #include <gtk/gtk.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <webkit2/webkit2.h>
 
@@ -11,8 +12,9 @@ char *uri_get_host(char *uri) {
         return NULL;
     }
 
-    int start = 0;
-    for (int i = 1; i < strlen(uri); i++) {
+    size_t uri_len = strlen(uri);
+    size_t start = 0;
+    for (size_t i = 1; i < uri_len; i++) {
         if (uri[i] != '/') {
             // only care about "/"
             continue;
@@ -22,9 +24,12 @@ char *uri_get_host(char *uri) {
             // we're at the the "//" in "https://"
             start = i + 1;
         } else if (start > 0) {
-            int len = i - start;
-            char *host = malloc(len);
-            strncpy(host, uri + start, len);
+            size_t len = i - start;
+            char *host = malloc(len + 1);
+            if (!host) {
+                return NULL;
+            }
+            memcpy(host, uri + start, len);
             host[len] = '\0';
             return host;
         }
@@ -48,7 +53,8 @@ static gboolean web_view_load_failed_tls(WebKitWebView *web_view, char *failing_
                                          GTlsCertificate *certificate,
                                          GTlsCertificateFlags errors,
                                          gpointer user_data) {
-    char *reason;
+    char reason_buf[256];
+    const char *reason;
     switch (errors) {
     case 0:
         reason = "No error - There was no error verifying the certificate.";
@@ -81,10 +87,11 @@ static gboolean web_view_load_failed_tls(WebKitWebView *web_view, char *failing_
                  "the certificate.";
         break;
     default:
-        snprintf(reason, 256,
+        snprintf(reason_buf, sizeof(reason_buf),
                  "Multiple failures (%d) - There were multiple errors during certificate "
                  "verification.",
                  errors);
+        reason = reason_buf;
         break;
     }
 
@@ -93,8 +100,9 @@ static gboolean web_view_load_failed_tls(WebKitWebView *web_view, char *failing_
     // something is up with Fedora 35's verification of this particular cert,
     // so we specifically only allow G_TLS_CERTIFICATE_GENERIC_ERROR for only this cert.
     char *host = uri_get_host(failing_uri);
-    if (errors & G_TLS_CERTIFICATE_GENERIC_ERROR &&
-        strncmp("account.live.com", host, 17) == 0) {
+    gboolean is_account_host = host && strncmp("account.live.com", host, 17) == 0;
+    free(host);
+    if (errors & G_TLS_CERTIFICATE_GENERIC_ERROR && is_account_host) {
         WebKitWebContext *context = webkit_web_view_get_context(web_view);
         // allow these failing domains from the webpage and reload
         webkit_web_context_allow_tls_certificate_for_host(context, certificate,
@@ -120,7 +128,7 @@ static void web_view_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_
     static const char *auth_complete_url = "https://login.live.com/oauth20_desktop.srf";
     const char *url = webkit_web_view_get_uri(web_view);
 
-    if (load_event == WEBKIT_LOAD_REDIRECTED &&
+    if (url && load_event == WEBKIT_LOAD_REDIRECTED &&
         strncmp(auth_complete_url, url, strlen(auth_complete_url)) == 0) {
         // catch redirects to the oauth2 redirect only and destroy the window
         strncpy(auth_redirect_url_ptr, url, 2047);
@@ -130,23 +138,67 @@ static void web_view_load_changed(WebKitWebView *web_view, WebKitLoadEvent load_
 }
 
 /**
+ * A current mainstream user agent. Microsoft's login pages sniff the user agent, and
+ * WebKitGTK's default one can result in a degraded page (the Authenticator number
+ * matching code may not be rendered). Override with ONEDRIVER_USER_AGENT.
+ */
+static const char *default_user_agent =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0";
+
+/**
+ * Load popups (window.open / target=_blank) in the same view instead of dropping them.
+ */
+static GtkWidget *web_view_create(WebKitWebView *web_view,
+                                  WebKitNavigationAction *navigation_action,
+                                  gpointer user_data) {
+    WebKitURIRequest *request = webkit_navigation_action_get_request(navigation_action);
+    const char *uri = request ? webkit_uri_request_get_uri(request) : NULL;
+    if (uri) {
+        webkit_web_view_load_uri(web_view, uri);
+    }
+    return NULL;
+}
+
+/**
  * Open a popup GTK auth window and return the final redirect location.
  */
 char *webkit_auth_window(char *auth_url, char *account_name) {
+    // known workaround for blank/stale rendering with WebKitGTK on Wayland/NVIDIA.
+    // Only set when the user hasn't chosen otherwise, and before gtk_init.
+    if (getenv("ONEDRIVER_NO_WEBKIT_WORKAROUNDS") == NULL) {
+        setenv("WEBKIT_DISABLE_DMABUF_RENDERER", "1", 0);
+    }
+
     gtk_init(NULL, NULL);
+    gboolean debug = getenv("ONEDRIVER_DEBUG_AUTH") != NULL;
     GtkWidget *auth_window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     if (account_name && strlen(account_name) > 0) {
         char title[512];
         snprintf(title, 511, "onedriver (%s)", account_name);
         gtk_window_set_title(GTK_WINDOW(auth_window), title);
-        gtk_window_set_default_size(GTK_WINDOW(auth_window), 525, 600);
     } else {
         gtk_window_set_title(GTK_WINDOW(auth_window), "onedriver");
-        gtk_window_set_default_size(GTK_WINDOW(auth_window), 450, 600);
     }
+    // large enough that the MFA number matching prompt is never off-screen
+    gtk_window_set_default_size(GTK_WINDOW(auth_window), 525, 700);
+    gtk_window_set_resizable(GTK_WINDOW(auth_window), TRUE);
 
     // create browser and add to gtk window
     WebKitWebView *web_view = WEBKIT_WEB_VIEW(webkit_web_view_new());
+    WebKitSettings *settings = webkit_web_view_get_settings(web_view);
+    const char *user_agent = getenv("ONEDRIVER_USER_AGENT");
+    webkit_settings_set_user_agent(settings, user_agent && *user_agent
+                                                 ? user_agent
+                                                 : default_user_agent);
+    webkit_settings_set_enable_javascript(settings, TRUE);
+    webkit_settings_set_javascript_can_open_windows_automatically(settings, TRUE);
+    if (debug) {
+        webkit_settings_set_enable_developer_extras(settings, TRUE);
+        webkit_settings_set_enable_write_console_messages_to_stdout(settings, TRUE);
+        g_print("onedriver: auth debug enabled, user agent: %s\n",
+                webkit_settings_get_user_agent(settings));
+    }
+
     gtk_container_add(GTK_CONTAINER(auth_window), GTK_WIDGET(web_view));
     webkit_web_view_load_uri(web_view, auth_url);
 
@@ -156,6 +208,7 @@ char *webkit_auth_window(char *auth_url, char *account_name) {
                      &auth_redirect_value);
     g_signal_connect(web_view, "load-failed-with-tls-errors",
                      G_CALLBACK(web_view_load_failed_tls), NULL);
+    g_signal_connect(web_view, "create", G_CALLBACK(web_view_create), NULL);
     g_signal_connect(auth_window, "destroy", G_CALLBACK(destroy_window), web_view);
 
     // show and grab focus

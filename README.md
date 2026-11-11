@@ -167,6 +167,31 @@ systemctl --user enable --now $SERVICE_NAME
 journalctl --user -u $SERVICE_NAME --since today
 ```
 
+## Login expired
+
+If renewing the login fails because of the network or a server problem,
+onedriver keeps the old token and retries in the background with a growing
+delay (one warning in the log). If Microsoft definitively rejects the stored
+login (`invalid_grant`, e.g. you changed your password or revoked the app),
+onedriver never opens a login window by itself and never exits: the mount
+stays up and serves files read-only from its cache. To log in again, run:
+
+```bash
+onedriver --auth-only ~/OneDrive      # add -n to log in with your normal web browser
+```
+
+The running mount picks up the new login within about 10 seconds and goes back
+online. Started from a terminal, onedriver still asks for the login at startup
+as before.
+
+If the embedded login window stays blank or doesn't show the Microsoft
+Authenticator number, run it with `ONEDRIVER_DEBUG_AUTH=1` to see the page's
+console output, make sure `gst-plugins-good` is installed, or use `-n` to log
+in with your normal browser. `ONEDRIVER_USER_AGENT` overrides the browser user
+agent sent to Microsoft's login page, and `ONEDRIVER_NO_WEBKIT_WORKAROUNDS=1`
+disables the `WEBKIT_DISABLE_DMABUF_RENDERER` workaround for blank windows on
+Wayland/NVIDIA.
+
 ## Building onedriver yourself
 
 In addition to the traditional [Go tooling](https://golang.org/dl/), you will

@@ -91,12 +91,18 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 					// max active upload sessions are capped at this limit for faster
 					// uploads of individual files and also to prevent possible server-
 					// side throttling that can cause errors.
-					if u.inFlight < maxUploadsInFlight {
+					if u.inFlight < maxUploadsInFlight && !u.auth.Expired() {
 						u.inFlight++
 						go session.Upload(u.auth)
 					}
 
 				case uploadErrored:
+					if u.auth.Expired() {
+						// not the upload's fault: keep it, without counting a
+						// retry, until the user has logged in again
+						session.setState(uploadNotStarted, nil)
+						continue
+					}
 					session.retries++
 					if session.retries > 5 {
 						log.Error().
