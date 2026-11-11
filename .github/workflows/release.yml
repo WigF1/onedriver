@@ -5,7 +5,16 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch: # build the RPMs without releasing, to try things out
+  # Run by hand: without a tag, builds the RPMs from master as workflow
+  # artifacts only (to try things out). With a tag, builds that release's
+  # sources for the Fedora versions listed below and adds the RPMs to the
+  # existing release (e.g. after adding a new Fedora version).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build and add RPMs to, e.g. v0.16.0 (empty: build only)"
+        required: false
+        default: ""
 
 permissions:
   contents: write
@@ -20,7 +29,7 @@ jobs:
       matrix:
         # Fedora releases to build for: an RPM is built per release. Update
         # this list when Fedora versions come and go.
-        fedora: ["43", "44"]
+        fedora: ["43", "44", "45"]
     steps:
       - name: Install build dependencies
         run: |
@@ -28,13 +37,17 @@ jobs:
             webkit2gtk4.1-devel json-glib-devel
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Check the tag matches the spec version
-        if: startsWith(github.ref, 'refs/tags/')
+        if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
           version=$(sed -n 's/^Version: *//p' onedriver.spec)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Version: $version in onedriver.spec"
+          if [ "v$version" != "$TAG" ]; then
+            echo "Tag $TAG does not match Version: $version in onedriver.spec"
             exit 1
           fi
 
@@ -60,7 +73,7 @@ jobs:
   release:
     name: Publish release
     needs: rpm
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || inputs.tag != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -69,5 +82,8 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*/*
+          # only used when the release is created; an existing release keeps
+          # its notes and gets the new or rebuilt files added
           generate_release_notes: true
