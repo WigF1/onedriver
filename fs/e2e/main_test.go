@@ -5,6 +5,7 @@ import (
 	"os"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jstaf/onedriver/fs/graph"
 	"github.com/rs/zerolog"
@@ -23,6 +24,12 @@ func TestMain(m *testing.M) {
 		return "", errors.New("interactive login attempted in a test")
 	}, func() error { return nil })
 	graph.StdinIsTerminal = func() bool { return false }
+
+	// short network timeouts so outage tests run quickly (still longer than
+	// the fake's upload delays)
+	graph.ConnectTimeout = 2 * time.Second
+	graph.ResponseTimeout = 4 * time.Second
+	graph.NetworkDownFor = 2 * time.Second
 
 	stop := startRouter()
 	code := m.Run()

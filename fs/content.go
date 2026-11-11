@@ -47,6 +47,11 @@ func (f *Filesystem) cacheIsValid(inode *Inode, fd *os.File) (bool, error) {
 // write lock.
 func (f *Filesystem) downloadLocked(inode *Inode, fd *os.File, ctx zerolog.Logger) fuse.Status {
 	id := inode.DriveItem.ID
+	if f.IsOffline() {
+		// fail right away instead of waiting for a network timeout (#472)
+		ctx.Warn().Msg("Offline, cannot download content that isn't cached.")
+		return fuse.EREMOTEIO
+	}
 
 	// write to tempfile first to ensure our download is good
 	tempID := "temp-" + id
@@ -128,7 +133,7 @@ func (f *Filesystem) readPending(inode *Inode, in *fuse.ReadIn, ctx zerolog.Logg
 		return nil, false, fuse.OK
 	}
 
-	if partial.Plan(size, in.Offset, int(in.Size)) == partial.Head {
+	if partial.Plan(size, in.Offset, int(in.Size)) == partial.Head && !f.IsOffline() {
 		data, err := inode.head.Read(hash, size, in.Offset, int(in.Size),
 			func(end uint64) ([]byte, error) {
 				ctx.Info().Uint64("bytes", end+1).

@@ -187,7 +187,10 @@ func NewFilesystem(auth *graph.Auth, cacheDir string) *Filesystem {
 func (f *Filesystem) IsOffline() bool {
 	f.RLock()
 	defer f.RUnlock()
-	return f.offline
+	// a request that just failed at the network level counts too, so the
+	// next operations answer from the cache right away instead of each
+	// waiting for its own timeout (#472)
+	return f.offline || f.auth.NetworkDown()
 }
 
 // TranslateID returns the DriveItemID for a given NodeID
@@ -379,10 +382,8 @@ func (f *Filesystem) GetChild(id string, name string, auth *graph.Auth) (*Inode,
 	if err != nil {
 		return nil, err
 	}
-	for _, child := range children {
-		if strings.EqualFold(child.Name(), name) {
-			return child, nil
-		}
+	if child, ok := children[foldName(name)]; ok {
+		return child, nil
 	}
 	return nil, errors.New("child does not exist")
 }
@@ -419,14 +420,21 @@ func (f *Filesystem) GetChildrenID(id string, auth *graph.Auth) (map[string]*Ino
 				// will be nil if deleted or never existed
 				continue
 			}
-			children[strings.ToLower(child.Name())] = child
+			children[foldName(child.Name())] = child
 		}
 		inode.RUnlock()
 		return children, nil
 	}
 	inode.RUnlock()
 
-	// We haven't fetched the children for this item yet, get them from the server.
+	// We haven't fetched the children for this item yet, get them from the
+	// server, unless it's unreachable: then don't make every lookup wait
+	// for a network timeout.
+	if f.IsOffline() {
+		log.Debug().Str("id", id).
+			Msg("Offline and no children found in cache. Pretending there are no children.")
+		return children, nil
+	}
 	fetched, err := graph.GetItemChildren(id, auth)
 	if err != nil {
 		if graph.IsOffline(err) {
@@ -449,7 +457,7 @@ func (f *Filesystem) GetChildrenID(id string, auth *graph.Auth) (map[string]*Ino
 		f.metadata.Store(child.DriveItem.ID, child)
 
 		// store in result map
-		children[strings.ToLower(child.Name())] = child
+		children[foldName(child.Name())] = child
 
 		// store id in parent item and increment parents subdirectory count
 		inode.children = append(inode.children, child.DriveItem.ID)
@@ -482,7 +490,7 @@ func (f *Filesystem) GetPath(path string, auth *graph.Auth) (*Inode, error) {
 
 	// from the root directory, traverse the chain of items till we reach our
 	// target ID.
-	path = strings.TrimSuffix(strings.ToLower(path), "/")
+	path = strings.TrimSuffix(foldName(path), "/")
 	split := strings.Split(path, "/")[1:] //omit leading "/"
 	var inode *Inode
 	for i := 0; i < len(split); i++ {
@@ -508,7 +516,7 @@ func (f *Filesystem) GetPath(path string, auth *graph.Auth) (*Inode, error) {
 // DeletePath an item from the cache by path. Must be called before Insert if
 // being used to move/rename an item.
 func (f *Filesystem) DeletePath(key string) {
-	inode, _ := f.GetPath(strings.ToLower(key), nil)
+	inode, _ := f.GetPath(foldName(key), nil)
 	if inode != nil {
 		f.DeleteID(inode.ID())
 	}
@@ -518,7 +526,7 @@ func (f *Filesystem) DeletePath(key string) {
 // created locally). Overwrites a cached item if present. Must be called after
 // delete if being used to move/rename an item.
 func (f *Filesystem) InsertPath(key string, auth *graph.Auth, inode *Inode) (uint64, error) {
-	key = strings.ToLower(key)
+	key = foldName(key)
 
 	// set the item.Parent.ID properly if the item hasn't been in the cache
 	// before or is being moved.
