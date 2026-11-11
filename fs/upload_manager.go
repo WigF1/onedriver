@@ -86,6 +86,24 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 			u.sessions[session.ID] = session
 
 		case cancelID := <-u.deletionQueue: // remove uploads for deleted items
+			session, exists := u.sessions[cancelID]
+			if exists && session.createsItem() {
+				switch session.getState() {
+				case uploadStarted:
+					// The item is being created on the server right now and
+					// can't be stopped: it was deleted locally before it had
+					// a server ID, so nothing deletes it there. Let the upload
+					// finish and delete the result (LibreOffice lock files
+					// left behind on OneDrive).
+					session.Lock()
+					session.discard = true
+					session.Unlock()
+					continue
+				case uploadComplete:
+					// finished, but the loop hasn't processed it yet
+					u.discardUploaded(session)
+				}
+			}
 			u.finishUpload(cancelID)
 
 		case req := <-u.waitQueue: // someone needs the result of an upload now
@@ -115,6 +133,15 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 					}
 
 				case uploadErrored:
+					session.Lock()
+					discard := session.discard
+					session.Unlock()
+					if discard {
+						// deleted locally and the upload didn't go through:
+						// nothing to retry and nothing to clean up
+						u.finishUpload(session.OldID)
+						continue
+					}
 					if u.auth.Expired() {
 						// not the upload's fault: keep it, without counting a
 						// retry, until the user has logged in again
@@ -144,6 +171,14 @@ func (u *UploadManager) uploadLoop(duration time.Duration) {
 					session.setState(uploadNotStarted, nil)
 
 				case uploadComplete:
+					session.Lock()
+					discard := session.discard
+					session.Unlock()
+					if discard {
+						u.discardUploaded(session)
+						u.finishUpload(session.OldID)
+						continue
+					}
 					log.Info().
 						Str("id", session.ID).
 						Str("oldID", session.OldID).
@@ -291,4 +326,23 @@ func (u *UploadManager) handleNotFound(session *UploadSession) bool {
 	session.cancel(u.auth)
 	session.setState(uploadNotStarted, nil)
 	return true
+}
+
+// discardUploaded deletes the server item that an upload created for a file
+// that was deleted locally while the upload was running.
+func (u *UploadManager) discardUploaded(session *UploadSession) {
+	session.Lock()
+	id, name := session.ID, session.Name
+	session.Unlock()
+	if isLocalID(id) {
+		return // never reached the server
+	}
+	log.Info().Str("id", id).Str("name", name).
+		Msg("File was deleted while it was being uploaded, deleting it on the server.")
+	go func() {
+		if err := graph.Remove(id, u.auth); err != nil && !graph.IsNotFound(err) {
+			log.Error().Err(err).Str("id", id).Str("name", name).
+				Msg("Could not delete a file that was deleted during its upload.")
+		}
+	}()
 }

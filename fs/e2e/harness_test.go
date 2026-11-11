@@ -4,6 +4,7 @@
 package e2e
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -29,7 +30,7 @@ const rootID = "ROOT"
 
 // fakeGraph is a minimal in-memory Graph API: files in the root folder and
 // in one level of subfolders. Paths look like "a.txt" or "Pictures/a.jpg";
-// item IDs are "id-" plus the path with "/" replaced by "~".
+// item IDs are "id-" plus the hex-encoded path (see idOf).
 type fakeGraph struct {
 	mu       sync.Mutex
 	files    map[string][]byte // path -> content
@@ -94,10 +95,16 @@ func newFakeGraph() *fakeGraph {
 	}
 }
 
-func idOf(path string) string { return "id-" + strings.ReplaceAll(path, "/", "~") }
+// idOf returns the default item ID of a path, URL-safe like real OneDrive
+// IDs (names can contain "#", "?", spaces...).
+func idOf(path string) string { return "id-" + hex.EncodeToString([]byte(path)) }
 
 func pathOf(id string) string {
-	return strings.ReplaceAll(strings.TrimPrefix(id, "id-"), "~", "/")
+	b, err := hex.DecodeString(strings.TrimPrefix(id, "id-"))
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
 
 type fakeUploadSession struct {

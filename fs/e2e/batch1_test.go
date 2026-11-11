@@ -97,7 +97,7 @@ func TestThrottledRequestsAreRetried(t *testing.T) {
 	g.add("small.txt", []byte("throttled content"))
 	mnt := mount(t, g, options{}).dir
 
-	g.throttleNext("/me/drive/items/id-small.txt", 1, 0)
+	g.throttleNext("/me/drive/items/"+idOf("small.txt"), 1, 0)
 	start := time.Now()
 	got, err := os.ReadFile(filepath.Join(mnt, "small.txt"))
 	if err != nil {
@@ -129,7 +129,7 @@ func TestThrottledForReportsBackoff(t *testing.T) {
 	g := newFakeGraph()
 	g.add("a.txt", []byte("a"))
 	mnt := mount(t, g, options{}).dir
-	g.throttleNext("/me/drive/items/id-a.txt", 3)
+	g.throttleNext("/me/drive/items/"+idOf("a.txt"), 3)
 	done := make(chan struct{})
 	go func() {
 		os.ReadFile(filepath.Join(mnt, "a.txt"))
@@ -218,7 +218,7 @@ func TestDeletionDeltaWithoutParentIsApplied(t *testing.T) {
 
 	g.remove("victim.txt")
 	g.queueDelta(graph.DriveItem{
-		ID:      "id-victim.txt",
+		ID:      idOf("victim.txt"),
 		Name:    "victim.txt",
 		Deleted: &graph.Deleted{State: "deleted"},
 		Parent:  &graph.DriveItemParent{},
