@@ -4,6 +4,7 @@
 package graph
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,9 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
+	"strings"
+	"sync/atomic"
 	"time"
 
 	"dario.cat/mergo"
@@ -33,6 +37,49 @@ type Header struct {
 	key, value string
 }
 
+// throttledUntil is the unix-nanosecond time until which Graph has asked us
+// to back off (HTTP 429/503 with Retry-After).
+var throttledUntil atomic.Int64
+
+// maxThrottleRetries bounds how many times a throttled request is retried.
+const maxThrottleRetries = 6
+
+// maxRetryAfter caps how long a single Retry-After is honoured, so a FUSE
+// operation can't hang for an unbounded time.
+const maxRetryAfter = 2 * time.Minute
+
+// ThrottledFor reports how long Graph has asked clients to back off, or zero
+// if not throttled. Background work (such as folder prefetching) should wait
+// this long before making more requests.
+func ThrottledFor() time.Duration {
+	d := time.Until(time.Unix(0, throttledUntil.Load()))
+	if d < 0 {
+		return 0
+	}
+	return d
+}
+
+// retryAfter returns how long to wait before retrying a throttled response:
+// the Retry-After header (seconds or HTTP date) if present, else exponential
+// backoff starting at one second.
+func retryAfter(response *http.Response, attempt int) time.Duration {
+	wait := time.Second << attempt
+	if header := response.Header.Get("Retry-After"); header != "" {
+		if secs, err := strconv.Atoi(header); err == nil && secs >= 0 {
+			wait = time.Duration(secs) * time.Second
+		} else if t, err := http.ParseTime(header); err == nil {
+			wait = time.Until(t)
+		}
+	}
+	if wait < 0 {
+		wait = 0
+	}
+	if wait > maxRetryAfter {
+		wait = maxRetryAfter
+	}
+	return wait
+}
+
 // Request performs an authenticated request to Microsoft Graph
 func Request(resource string, auth *Auth, method string, content io.Reader, headers ...Header) ([]byte, error) {
 	if auth == nil || auth.AccessToken == "" {
@@ -43,61 +90,105 @@ func Request(resource string, auth *Auth, method string, content io.Reader, head
 
 	auth.Refresh()
 
-	client := &http.Client{Timeout: 60 * time.Second}
-	request, _ := http.NewRequest(method, GraphURL+resource, content)
-	request.Header.Add("Authorization", "bearer "+auth.AccessToken)
-	switch method { // request type-specific code here
-	case "PATCH":
-		request.Header.Add("If-Match", "*")
-		request.Header.Add("Content-Type", "application/json")
-	case "POST":
-		request.Header.Add("Content-Type", "application/json")
-	case "PUT":
-		request.Header.Add("Content-Type", "text/plain")
-	}
-	for _, header := range headers {
-		request.Header.Add(header.key, header.value)
+	// buffer the body so the request can be re-sent on retries
+	var body []byte
+	if content != nil {
+		var err error
+		if body, err = io.ReadAll(content); err != nil {
+			return nil, err
+		}
 	}
 
-	response, err := client.Do(request)
+	client := &http.Client{Timeout: 60 * time.Second}
+	do := func() (*http.Response, []byte, error) {
+		var reader io.Reader
+		if body != nil {
+			reader = bytes.NewReader(body)
+		}
+		request, err := http.NewRequest(method, GraphURL+resource, reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		request.Header.Add("Authorization", "bearer "+auth.AccessToken)
+		switch method { // request type-specific code here
+		case "PATCH":
+			request.Header.Add("If-Match", "*")
+			request.Header.Add("Content-Type", "application/json")
+		case "POST":
+			request.Header.Add("Content-Type", "application/json")
+		case "PUT":
+			request.Header.Add("Content-Type", "text/plain")
+		}
+		for _, header := range headers {
+			request.Header.Add(header.key, header.value)
+		}
+		response, err := client.Do(request)
+		if err != nil {
+			return nil, nil, err
+		}
+		respBody, _ := io.ReadAll(response.Body)
+		response.Body.Close()
+		return response, respBody, nil
+	}
+
+	response, respBody, err := do()
 	if err != nil {
 		// the actual request failed
 		return nil, err
 	}
-	body, _ := io.ReadAll(response.Body)
-	response.Body.Close()
+
+	// throttled: wait as long as the server asks, then retry
+	for attempt := 0; (response.StatusCode == http.StatusTooManyRequests ||
+		(response.StatusCode == http.StatusServiceUnavailable &&
+			response.Header.Get("Retry-After") != "")) && attempt < maxThrottleRetries; attempt++ {
+		wait := retryAfter(response, attempt)
+		until := time.Now().Add(wait).UnixNano()
+		if until > throttledUntil.Load() {
+			throttledUntil.Store(until)
+		}
+		log.Warn().
+			Int("status", response.StatusCode).
+			Dur("retryAfter", wait).
+			Str("resource", resource).
+			Msg("Throttled by the Graph API, backing off.")
+		time.Sleep(wait)
+		if response, respBody, err = do(); err != nil {
+			return nil, err
+		}
+	}
 
 	if response.StatusCode == 401 {
-		var err graphError
-		json.Unmarshal(body, &err)
+		var gerr graphError
+		json.Unmarshal(respBody, &gerr)
 		log.Warn().
-			Str("code", err.Error.Code).
-			Str("message", err.Error.Message).
+			Str("code", gerr.Error.Code).
+			Str("message", gerr.Error.Message).
 			Msg("Authentication token invalid or new app permissions required, " +
 				"forcing reauth before retrying.")
 
 		reauth := newAuth(auth.AuthConfig, auth.path, false)
 		mergo.Merge(auth, reauth, mergo.WithOverride)
-		request.Header.Set("Authorization", "bearer "+auth.AccessToken)
 	}
 	if response.StatusCode >= 500 || response.StatusCode == 401 {
 		// the onedrive API is having issues, retry once
-		response, err = client.Do(request)
-		if err != nil {
+		if response, respBody, err = do(); err != nil {
 			return nil, err
 		}
-		body, _ = io.ReadAll(response.Body)
-		response.Body.Close()
 	}
 
 	if response.StatusCode >= 400 {
 		// something was wrong with the request
-		var err graphError
-		json.Unmarshal(body, &err)
+		var gerr graphError
+		json.Unmarshal(respBody, &gerr)
 		return nil, fmt.Errorf("HTTP %d - %s: %s",
-			response.StatusCode, err.Error.Code, err.Error.Message)
+			response.StatusCode, gerr.Error.Code, gerr.Error.Message)
 	}
-	return body, nil
+	return respBody, nil
+}
+
+// IsNotFound reports whether err is a Graph "item not found" (HTTP 404) error.
+func IsNotFound(err error) bool {
+	return err != nil && strings.HasPrefix(err.Error(), "HTTP 404 - ")
 }
 
 // Get is a convenience wrapper around Request

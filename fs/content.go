@@ -59,6 +59,13 @@ func (f *Filesystem) downloadLocked(inode *Inode, fd *os.File, ctx zerolog.Logge
 
 	// replace content only on a match
 	size, err := graph.GetItemContentStream(id, f.auth, temp)
+	if graph.IsNotFound(err) {
+		// deleted on the server and we missed the delta: forget it once the
+		// caller has released the inode lock (DeleteID takes it)
+		ctx.Warn().Msg("Item no longer exists on the server, removing it locally.")
+		go f.forgetDeleted(id)
+		return fuse.ENOENT
+	}
 	if err != nil || !inode.VerifyChecksum(graph.QuickXORHashStream(temp)) {
 		ctx.Error().Err(err).Msg("Failed to fetch remote content.")
 		return fuse.EREMOTEIO
@@ -134,4 +141,11 @@ func (f *Filesystem) readPending(inode *Inode, in *fuse.ReadIn, ctx zerolog.Logg
 		ctx.Warn().Err(err).Msg("Range request failed, falling back to full download.")
 	}
 	return nil, false, f.ensureContent(inode, ctx)
+}
+
+// forgetDeleted removes an item that no longer exists on the server from the
+// local metadata and content caches.
+func (f *Filesystem) forgetDeleted(id string) {
+	f.DeleteID(id)
+	f.content.Delete(id)
 }
