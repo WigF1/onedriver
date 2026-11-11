@@ -43,6 +43,12 @@ type fakeGraph struct {
 	rejected map[string]bool   // access tokens answered with HTTP 401
 	modTime  time.Time
 
+	byID        map[string]string // item ID -> path, for items whose ID isn't idOf(path)
+	uploadCount map[string]int    // path -> completed content uploads
+	sessions    map[string]*fakeUploadSession
+	nextID      int
+	uploadDelay time.Duration // delay before content uploads are processed
+
 	pageSize     int  // children are returned in pages of this size if > 0
 	corruptPages int  // this many listing pages after the first are invalid JSON
 	down         bool // drop every connection, as if the network were gone
@@ -73,15 +79,18 @@ func (g *fakeGraph) posts() int {
 
 func newFakeGraph() *fakeGraph {
 	return &fakeGraph{
-		files:    make(map[string][]byte),
-		folders:  make(map[string]bool),
-		ranges:   make(map[string]int),
-		fulls:    make(map[string]int),
-		uploads:  make(map[string][]byte),
-		requests: make(map[string]int),
-		throttle: make(map[string][]int),
-		rejected: make(map[string]bool),
-		modTime:  time.Now().Add(-time.Hour).UTC().Truncate(time.Second),
+		files:       make(map[string][]byte),
+		folders:     make(map[string]bool),
+		ranges:      make(map[string]int),
+		fulls:       make(map[string]int),
+		uploads:     make(map[string][]byte),
+		requests:    make(map[string]int),
+		throttle:    make(map[string][]int),
+		rejected:    make(map[string]bool),
+		byID:        make(map[string]string),
+		uploadCount: make(map[string]int),
+		sessions:    make(map[string]*fakeUploadSession),
+		modTime:     time.Now().Add(-time.Hour).UTC().Truncate(time.Second),
 	}
 }
 
@@ -89,6 +98,76 @@ func idOf(path string) string { return "id-" + strings.ReplaceAll(path, "/", "~"
 
 func pathOf(id string) string {
 	return strings.ReplaceAll(strings.TrimPrefix(id, "id-"), "~", "/")
+}
+
+type fakeUploadSession struct {
+	path string
+	data []byte
+}
+
+// idFor returns the item ID of a path: a reassigned ID (after a rename) if
+// there is one, else idOf(path). Caller holds g.mu.
+func (g *fakeGraph) idFor(path string) string {
+	for id, p := range g.byID {
+		if p == path {
+			return id
+		}
+	}
+	return idOf(path)
+}
+
+// pathFor returns the path of an item ID, "" if the ID is unknown (e.g. the
+// item was replaced). Caller holds g.mu.
+func (g *fakeGraph) pathFor(id string) string {
+	if p, ok := g.byID[id]; ok {
+		return p
+	}
+	p := pathOf(id)
+	if g.idFor(p) != id {
+		return "" // the path now belongs to another item
+	}
+	return p
+}
+
+// rename moves the item with id to newPath, replacing what was there and
+// keeping the item's ID. Caller holds g.mu.
+func (g *fakeGraph) rename(id, newPath string) bool {
+	old := g.pathFor(id)
+	data, ok := g.files[old]
+	if old == "" || !ok {
+		return false
+	}
+	if other := g.idFor(newPath); other != id {
+		delete(g.byID, other)
+	}
+	delete(g.files, old)
+	g.files[newPath] = data
+	g.byID[id] = newPath
+	return true
+}
+
+func (g *fakeGraph) uploadsOf(path string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.uploadCount[path]
+}
+
+func (g *fakeGraph) paths() []string {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	var out []string
+	for p := range g.files {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (g *fakeGraph) content(path string) ([]byte, bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	data, ok := g.files[path]
+	return data, ok
 }
 
 // add creates a file; a path "Folder/name" also creates the folder.
@@ -158,16 +237,16 @@ func (g *fakeGraph) item(path string) graph.DriveItem {
 	}
 	parentID, name := rootID, path
 	if i := strings.LastIndex(path, "/"); i > 0 {
-		parentID, name = idOf(path[:i]), path[i+1:]
+		parentID, name = g.idFor(path[:i]), path[i+1:]
 	}
 	parent := &graph.DriveItemParent{ID: parentID, DriveType: graph.DriveTypePersonal}
 	if path == trashName() || g.folders[path] {
-		return graph.DriveItem{ID: idOf(path), Name: name, ModTime: &mt,
+		return graph.DriveItem{ID: g.idFor(path), Name: name, ModTime: &mt,
 			Parent: parent, Folder: &graph.Folder{}}
 	}
 	data := g.files[path]
 	return graph.DriveItem{
-		ID: idOf(path), Name: name, Size: uint64(len(data)), ModTime: &mt,
+		ID: g.idFor(path), Name: name, Size: uint64(len(data)), ModTime: &mt,
 		Parent: parent, ETag: "etag-" + path + "-" + strconv.Itoa(len(data)),
 		File: &graph.File{Hashes: graph.Hashes{QuickXorHash: graph.QuickXORHash(&data)}},
 	}
@@ -212,6 +291,12 @@ func notFound(w http.ResponseWriter) {
 }
 
 func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	g.mu.Lock()
+	delay := g.uploadDelay
+	g.mu.Unlock()
+	if delay > 0 && (r.Method == "PUT" || strings.HasSuffix(r.URL.Path, "/createUploadSession")) {
+		time.Sleep(delay) // a slow upload, still running when the app renames
+	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.down {
@@ -262,27 +347,68 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		id := strings.TrimSuffix(strings.TrimPrefix(p, items), "/children")
 		folder := ""
 		if id != rootID {
-			folder = pathOf(id)
+			folder = g.pathFor(id)
 			if !g.folders[folder] && folder != trashName() {
 				notFound(w)
 				return
 			}
 		}
 		g.serveChildren(w, r, p, g.children(folder))
-	case r.Method == "PUT" && strings.HasPrefix(p, items) && strings.Contains(p, ":/") &&
-		strings.HasSuffix(p, ":/content"):
-		// small upload of a new file: /me/drive/items/{parent}:/{name}:/content
-		rest := strings.TrimSuffix(strings.TrimPrefix(p, items), ":/content")
+	case (r.Method == "PUT" && strings.HasSuffix(p, ":/content") ||
+		r.Method == "POST" && strings.HasSuffix(p, ":/createUploadSession")) &&
+		strings.HasPrefix(p, items) && strings.Contains(p, ":/"):
+		// upload by name: /me/drive/items/{parent}:/{name}:/content (small)
+		// or :/createUploadSession (large)
+		rest := strings.TrimPrefix(p, items)
+		rest = rest[:strings.LastIndex(rest, ":/")]
 		parts := strings.SplitN(rest, ":/", 2)
 		path := parts[1]
 		if parts[0] != rootID {
-			path = pathOf(parts[0]) + "/" + parts[1]
+			path = g.pathFor(parts[0]) + "/" + parts[1]
+		}
+		if r.Method == "POST" {
+			g.createSession(w, r, path)
+			return
 		}
 		g.storeUpload(w, r, path)
-	case r.Method == "PUT" && strings.HasPrefix(p, items+"id-") && strings.HasSuffix(p, "/content"):
-		g.storeUpload(w, r, pathOf(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content")))
-	case strings.HasPrefix(p, items+"id-") && strings.HasSuffix(p, "/content"):
-		path := pathOf(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content"))
+	case r.Method == "POST" && strings.HasPrefix(p, items) && strings.HasSuffix(p, "/createUploadSession"):
+		path := g.pathFor(strings.TrimSuffix(strings.TrimPrefix(p, items), "/createUploadSession"))
+		if _, ok := g.files[path]; !ok {
+			notFound(w)
+			return
+		}
+		g.createSession(w, r, path)
+	case r.Method == "PUT" && strings.HasPrefix(p, items) && strings.HasSuffix(p, "/content"):
+		path := g.pathFor(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content"))
+		if _, ok := g.files[path]; !ok {
+			notFound(w) // uploading to an item that no longer exists
+			return
+		}
+		g.storeUpload(w, r, path)
+	case r.Method == "DELETE" && strings.HasPrefix(p, items):
+		path := g.pathFor(strings.TrimPrefix(p, items))
+		if _, ok := g.files[path]; !ok {
+			notFound(w)
+			return
+		}
+		delete(g.files, path)
+		w.WriteHeader(http.StatusNoContent)
+	case r.Method == "PATCH" && strings.HasPrefix(p, items):
+		// rename/move: {"name": ..., "parentReference": {"id": ...}}
+		id := strings.TrimPrefix(p, items)
+		var patch graph.DriveItem
+		json.NewDecoder(r.Body).Decode(&patch)
+		newPath := patch.Name
+		if patch.Parent != nil && patch.Parent.ID != "" && patch.Parent.ID != rootID {
+			newPath = g.pathFor(patch.Parent.ID) + "/" + patch.Name
+		}
+		if !g.rename(id, newPath) {
+			notFound(w)
+			return
+		}
+		writeJSON(w, g.item(newPath))
+	case strings.HasPrefix(p, items) && strings.HasSuffix(p, "/content"):
+		path := g.pathFor(strings.TrimSuffix(strings.TrimPrefix(p, items), "/content"))
 		data, ok := g.files[path]
 		if !ok {
 			notFound(w)
@@ -306,8 +432,20 @@ func (g *fakeGraph) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		g.fulls[path]++
 		w.Write(data)
-	case strings.HasPrefix(p, items+"id-"):
-		path := pathOf(strings.TrimPrefix(p, items))
+	case strings.HasPrefix(p, items) && strings.Contains(p, ":/"):
+		// GetItemChild: /me/drive/items/{parent}:/{name}
+		parts := strings.SplitN(strings.TrimPrefix(p, items), ":/", 2)
+		path := parts[1]
+		if parts[0] != rootID {
+			path = g.pathFor(parts[0]) + "/" + parts[1]
+		}
+		if _, ok := g.files[path]; !ok {
+			notFound(w)
+			return
+		}
+		writeJSON(w, g.item(path))
+	case strings.HasPrefix(p, items):
+		path := g.pathFor(strings.TrimPrefix(p, items))
 		if _, ok := g.files[path]; !ok && path != trashName() && !g.folders[path] {
 			notFound(w)
 			return
@@ -345,9 +483,73 @@ func (g *fakeGraph) serveChildren(w http.ResponseWriter, r *http.Request, p stri
 
 func (g *fakeGraph) storeUpload(w http.ResponseWriter, r *http.Request, path string) {
 	data, _ := io.ReadAll(r.Body)
-	g.files[path] = data
-	g.uploads[path] = data
+	g.saveUpload(path, data)
 	writeJSON(w, g.item(path))
+}
+
+// saveUpload stores uploaded content at path (a new item if nothing is
+// there). Caller holds g.mu.
+func (g *fakeGraph) saveUpload(path string, data []byte) {
+	if _, exists := g.files[path]; !exists {
+		if owner, used := g.byID[idOf(path)]; used && owner != path {
+			// the default ID for this path belongs to an item that was
+			// renamed away: like OneDrive, give the new item a fresh ID
+			g.nextID++
+			g.byID[fmt.Sprintf("id-new%d", g.nextID)] = path
+		}
+	}
+	g.files[path] = data
+	if i := strings.Index(path, "/"); i > 0 {
+		g.folders[path[:i]] = true
+	}
+	g.uploads[path] = data
+	g.uploadCount[path]++
+}
+
+// createSession starts a large-file upload session; chunks go to the
+// returned (pre-authenticated) uploadUrl. Caller holds g.mu.
+func (g *fakeGraph) createSession(w http.ResponseWriter, r *http.Request, path string) {
+	g.nextID++
+	sid := strconv.Itoa(g.nextID)
+	g.sessions[sid] = &fakeUploadSession{path: path}
+	token := strings.TrimPrefix(r.Header.Get("Authorization"), "bearer ")
+	writeJSON(w, map[string]interface{}{
+		"uploadUrl":          graph.GraphURL[:len(graph.GraphURL)-len("/v1.0")] + "/upload/" + token + "/" + sid,
+		"expirationDateTime": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	})
+}
+
+// handleChunk receives one chunk of a large upload.
+func (g *fakeGraph) handleChunk(w http.ResponseWriter, r *http.Request, sid string) {
+	g.mu.Lock()
+	delay := g.uploadDelay
+	g.mu.Unlock()
+	time.Sleep(delay)
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	session, ok := g.sessions[sid]
+	if !ok {
+		notFound(w)
+		return
+	}
+	data, _ := io.ReadAll(r.Body)
+	var start, end, total int
+	fmt.Sscanf(r.Header.Get("Content-Range"), "bytes %d-%d/%d", &start, &end, &total)
+	if start != len(session.data) {
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		w.Write([]byte(`{"error":{"code":"invalidRange","message":"bad range"}}`))
+		return
+	}
+	session.data = append(session.data, data...)
+	if len(session.data) < total {
+		w.WriteHeader(http.StatusAccepted)
+		writeJSON(w, map[string]interface{}{"nextExpectedRanges": []string{fmt.Sprintf("%d-", len(session.data))}})
+		return
+	}
+	delete(g.sessions, sid)
+	g.saveUpload(session.path, session.data)
+	w.WriteHeader(http.StatusCreated)
+	writeJSON(w, g.item(session.path))
 }
 
 // fakeRouter is the single Graph endpoint for the whole test binary, so
@@ -421,6 +623,18 @@ func (r *fakeRouter) handleToken(w http.ResponseWriter, req *http.Request) {
 func (r *fakeRouter) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	if strings.HasPrefix(req.URL.Path, "/oauth/") {
 		r.handleToken(w, req)
+		return
+	}
+	if strings.HasPrefix(req.URL.Path, "/upload/") {
+		parts := strings.SplitN(strings.TrimPrefix(req.URL.Path, "/upload/"), "/", 2)
+		r.mu.Lock()
+		g := r.graphs[parts[0]]
+		r.mu.Unlock()
+		if g == nil || len(parts) != 2 {
+			http.Error(w, "gone", http.StatusServiceUnavailable)
+			return
+		}
+		g.handleChunk(w, req, parts[1])
 		return
 	}
 	token := strings.TrimPrefix(req.Header.Get("Authorization"), "bearer ")
