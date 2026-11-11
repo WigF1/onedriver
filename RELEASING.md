@@ -11,7 +11,7 @@ repository clone or build tools needed.
    forks: open the repository's **Actions** tab and click
    *"I understand my workflows, go ahead and enable them"*.
 2. Check the Fedora versions in `.github/workflows/release.yml`
-   (`fedora: ["43", "44"]`) cover the machines you install on
+   (`fedora: ["43", "44", "45"]`) cover the machines you install on
    (`rpm -E %fedora` shows a machine's version). Update the list as Fedora
    releases come and go.
 
@@ -38,7 +38,7 @@ repository clone or build tools needed.
 5. Watch the **Release** workflow in the Actions tab (about 5–10 minutes). The
    tag must match `Version:` in `onedriver.spec`, otherwise the build stops
    with an error. When it's done, the release page has:
-   - `onedriver-0.16.1-1.fc43.x86_64.rpm`, `onedriver-0.16.1-1.fc44.x86_64.rpm`, …
+   - `onedriver-0.16.1-1.fc43.x86_64.rpm`, `…fc44…`, `…fc45…`
    - the matching `.src.rpm` files
    - `onedriver-0.16.1.tar.gz`: sources with vendored Go modules
 
@@ -46,8 +46,15 @@ repository clone or build tools needed.
    the release page if you like.
 
 To try a build without releasing, run the Release workflow by hand
-(**Actions → Release → Run workflow**). The RPMs are then attached to the
-workflow run as artifacts and nothing is published.
+(**Actions → Release → Run workflow**) and leave the tag empty. The RPMs are
+then attached to the workflow run as artifacts and nothing is published.
+
+**Adding a Fedora version to an existing release:** add it to the `fedora:`
+list in `release.yml` and merge that, then run the Release workflow by hand
+with the release's tag (e.g. `v0.16.0`). It builds that tag's sources for all
+listed versions and adds the RPMs to the release (existing ones are replaced
+by identical rebuilds). From the command line:
+`gh workflow run release.yml -R WigF1/onedriver -f tag=v0.16.0`.
 
 ## Installing on another Fedora machine
 
